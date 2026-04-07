@@ -5,6 +5,7 @@
 //!   VDESK_DIRECT_HOST — 다이렉트 모드 에이전트 IP (기본: 127.0.0.1)
 //!   VDESK_DIRECT_PORT — 다이렉트 모드 포트 (기본: 20020)
 //!   VDESK_DIRECT_KEY  — 다이렉트 모드 세션키 (기본: "direct")
+//!   VDESK_MOUSE_GLOBAL — 1이면 마우스를 가상 화면 절대 좌표로 전송 (백엔드 경로에서 같은 PC 테스트 시)
 //!   VDESK_API_URL     — 백엔드 URL (기본: http://localhost:8080)
 //!   VDESK_EMAIL       — 이메일
 //!   VDESK_PASSWORD    — 비밀번호
@@ -15,6 +16,7 @@ mod connection;
 mod decoder;
 mod display;
 mod session;
+mod vpx_dec;
 
 use anyhow::Result;
 use hbb_common::log;
@@ -39,7 +41,7 @@ fn main() -> Result<()> {
 
         log::info!("★ 다이렉트 모드 — {}:{} 직접 연결 (키: {})", host, port, session_key);
 
-        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<display::FrameBuffer>(2);
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<display::FrameBuffer>(1);
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<display::InputEvent>();
 
         std::thread::spawn(move || {
@@ -57,7 +59,7 @@ fn main() -> Result<()> {
             });
         });
 
-        display::run_event_loop(frame_rx, Some(input_tx))?;
+        display::run_event_loop(frame_rx, Some(input_tx), false)?;
         log::info!("[main] 종료");
         return Ok(());
     }
@@ -168,7 +170,9 @@ fn main() -> Result<()> {
     });
 
     // winit 이벤트 루프 (메인 스레드 필수)
-    display::run_event_loop(frame_rx, Some(input_tx))?;
+    let mouse_global =
+        std::env::var("VDESK_MOUSE_GLOBAL").map_or(false, |v| v == "1");
+    display::run_event_loop(frame_rx, Some(input_tx), mouse_global)?;
 
     log::info!("[main] 종료");
     Ok(())

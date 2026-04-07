@@ -23,10 +23,17 @@ env_logger = "0.11"
 anyhow = "1.0"
 chrono = "0.4"
 
-# 화면 캡처 (순수 Rust, native binding 불필요)
-screenshots = "0.8"
-# JPEG 인코딩
+# JPEG 폴백 (VP9 실패 시)
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winapi = { version = "0.3", features = ["winsock2", "iphlpapi", "winuser"] }
+winapi = { version = "0.3", features = [
+    "winsock2", "iphlpapi", "winuser", "timeapi",
+    # DXGI Desktop Duplication
+    "dxgi", "dxgi1_2", "dxgitype", "dxgiformat",
+    "d3d11", "d3dcommon",
+    "winerror",
+] }
+
+[build-dependencies]
+cc = "1"

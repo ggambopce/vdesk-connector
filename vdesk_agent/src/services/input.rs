@@ -25,7 +25,7 @@ mod win {
     use winapi::um::winuser::{
         GetSystemMetrics, SendInput,
         INPUT, INPUT_KEYBOARD, INPUT_MOUSE,
-        KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+        KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
         MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
         MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
@@ -34,6 +34,17 @@ mod win {
 
     // MOUSEEVENTF_HWHEEL = 0x1000 (winapi 0.3.x에 없는 경우 직접 정의)
     const MOUSEEVENTF_HWHEEL: u32 = 0x1000;
+    /// 가상 데스크톱 전체에 절대 좌표 매핑 (멀티 모니터)
+    const MOUSEEVENTF_VIRTUALDESK: u32 = 0x4000;
+
+    /// SendInput dwExtraInfo 마커: 에이전트가 주입한 이벤트임을 표시
+    /// 뷰어가 이 마커를 보면 자신에게 돌아온 주입 이벤트로 판단해 무시 (피드백 루프 차단)
+    pub const VDESK_INPUT_MARK: usize = 0x5DEC_0001;
+
+    const SM_XVIRTUALSCREEN: i32 = 76;
+    const SM_YVIRTUALSCREEN: i32 = 77;
+    const SM_CXVIRTUALSCREEN: i32 = 78;
+    const SM_CYVIRTUALSCREEN: i32 = 79;
 
     fn screen_size() -> (i32, i32) {
         unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
@@ -64,7 +75,50 @@ mod win {
                 mouseData: 0,
                 dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: VDESK_INPUT_MARK,
+            };
+            SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);
+        }
+    }
+
+    /// 뷰어가 계산한 가상 화면 기준 물리 픽셀 (inner_position + 클라이언트 좌표)
+    pub fn inject_mouse_move_global(gx: i32, gy: i32) {
+        if super::NO_INJECT.load(super::Ordering::Relaxed) {
+            return;
+        }
+        let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+        let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+
+        let rx = gx.clamp(vx, vx.saturating_add(vw).saturating_sub(1));
+        let ry = gy.clamp(vy, vy.saturating_add(vh).saturating_sub(1));
+
+        let abs_x = if vw > 1 {
+            (rx - vx) as i64 * 65535 / (vw - 1) as i64
+        } else {
+            0
+        }
+        .clamp(0, 65535) as i32;
+        let abs_y = if vh > 1 {
+            (ry - vy) as i64 * 65535 / (vh - 1) as i64
+        } else {
+            0
+        }
+        .clamp(0, 65535) as i32;
+
+        unsafe {
+            let mut inp: INPUT = mem::zeroed();
+            inp.type_ = INPUT_MOUSE;
+            *inp.u.mi_mut() = MOUSEINPUT {
+                dx: abs_x,
+                dy: abs_y,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE
+                    | MOUSEEVENTF_ABSOLUTE
+                    | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: VDESK_INPUT_MARK,
             };
             SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);
         }
@@ -87,7 +141,8 @@ mod win {
             let mut inp: INPUT = mem::zeroed();
             inp.type_ = INPUT_MOUSE;
             *inp.u.mi_mut() = MOUSEINPUT {
-                dx: 0, dy: 0, mouseData: 0, dwFlags: flags, time: 0, dwExtraInfo: 0,
+                dx: 0, dy: 0, mouseData: 0, dwFlags: flags, time: 0,
+                dwExtraInfo: VDESK_INPUT_MARK,
             };
             SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);
         }
@@ -107,7 +162,7 @@ mod win {
                     dx: 0, dy: 0,
                     mouseData: dy as u32,
                     dwFlags: MOUSEEVENTF_WHEEL,
-                    time: 0, dwExtraInfo: 0,
+                    time: 0, dwExtraInfo: VDESK_INPUT_MARK,
                 };
                 SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);
             }
@@ -118,48 +173,36 @@ mod win {
                     dx: 0, dy: 0,
                     mouseData: dx as u32,
                     dwFlags: MOUSEEVENTF_HWHEEL,
-                    time: 0, dwExtraInfo: 0,
+                    time: 0, dwExtraInfo: VDESK_INPUT_MARK,
                 };
                 SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);
             }
         }
     }
 
-    /// 유니코드 문자 주입 (한글·CJK 포함)
-    /// KEYEVENTF_UNICODE를 사용하므로 IME 우회하여 직접 삽입
-    pub fn inject_char(text: &str) {
+    /// VK 코드 + scan 코드로 직접 키 주입 (글로벌 훅 경유)
+    pub fn inject_key_vk(vk: u32, scan: u16, pressed: bool, extended: bool) {
         if super::NO_INJECT.load(super::Ordering::Relaxed) {
             return;
         }
-        for ch in text.chars() {
-            let n = ch as u32;
-            if n > 0xFFFF {
-                // BMP 외 문자 → UTF-16 서로게이트 페어
-                let n = n - 0x10000;
-                let hi = (0xD800 + (n >> 10)) as u16;
-                let lo = (0xDC00 + (n & 0x3FF)) as u16;
-                send_unicode_key(hi, false);
-                send_unicode_key(lo, false);
-                send_unicode_key(hi, true);
-                send_unicode_key(lo, true);
-            } else {
-                send_unicode_key(n as u16, false);
-                send_unicode_key(n as u16, true);
-            }
-        }
-    }
 
-    fn send_unicode_key(wch: u16, key_up: bool) {
         unsafe {
             let mut inp: INPUT = mem::zeroed();
             inp.type_ = INPUT_KEYBOARD;
-            *inp.u.ki_mut() = KEYBDINPUT {
-                wVk: 0,
-                wScan: wch,
-                dwFlags: KEYEVENTF_UNICODE | if key_up { KEYEVENTF_KEYUP } else { 0 },
-                time: 0,
-                dwExtraInfo: 0,
-            };
+
+            if false {
+            } else {
+                let mut flags = if pressed { 0 } else { KEYEVENTF_KEYUP };
+                if extended { flags |= KEYEVENTF_EXTENDEDKEY; }
+                *inp.u.ki_mut() = KEYBDINPUT {
+                    wVk:         vk as u16,
+                    wScan:       scan,
+                    dwFlags:     flags,
+                    time:        0,
+                    dwExtraInfo: VDESK_INPUT_MARK,
+                };
+            }
+
             SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);
         }
     }
@@ -206,7 +249,7 @@ mod win {
                 wScan: 0,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: VDESK_INPUT_MARK,
             };
             SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);
         }
@@ -315,15 +358,20 @@ mod win {
 // ── 플랫폼별 공개 API ─────────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
-pub use win::{inject_char, inject_key, inject_mouse_button, inject_mouse_move, inject_scroll};
+pub use win::{
+    inject_key, inject_key_vk, inject_mouse_button, inject_mouse_move,
+    inject_mouse_move_global, inject_scroll,
+};
 
 #[cfg(not(target_os = "windows"))]
 pub fn inject_mouse_move(_vx: i32, _vy: i32, _win_w: i32, _win_h: i32) {}
+#[cfg(not(target_os = "windows"))]
+pub fn inject_mouse_move_global(_gx: i32, _gy: i32) {}
 #[cfg(not(target_os = "windows"))]
 pub fn inject_mouse_button(_button: u8, _pressed: bool) {}
 #[cfg(not(target_os = "windows"))]
 pub fn inject_key(_key: u32, _pressed: bool) {}
 #[cfg(not(target_os = "windows"))]
-pub fn inject_scroll(_dx: i16, _dy: i16) {}
+pub fn inject_key_vk(_vk: u32, _scan: u16, _pressed: bool, _extended: bool) {}
 #[cfg(not(target_os = "windows"))]
-pub fn inject_char(_text: &str) {}
+pub fn inject_scroll(_dx: i16, _dy: i16) {}

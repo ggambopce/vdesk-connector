@@ -1,17 +1,15 @@
 //! Viewer 세션 루프
 //!
 //! ── 수신 (에이전트 → 뷰어) ────────────────────────────────────────────────────
-//!   0x10 Init:  [width(4BE), height(4BE), fps(1)]   첫 연결 시 화면 정보
-//!   0x11 Frame: [jpeg_len(4BE), jpeg_data]           프레임
-//!   0x12 Pong:  [timestamp(8BE)]                     RTT 측정 응답
+//!   0x10 Init:  [width(4BE), height(4BE), fps(1), codec(1)]
+//!               codec: 1=VP9
+//!   0x11 Frame: [is_key(1), data_len(4BE), vp9_data]
+//!   0x12 Pong:  [timestamp(8BE)]
 //!
 //! ── 송신 (뷰어 → 에이전트) ───────────────────────────────────────────────────
-//!   0x01 MouseMove:   [x(4BE), y(4BE), win_w(2BE), win_h(2BE)]
-//!   0x02 MouseButton: [button(1), pressed(1)]
-//!   0x03 KeyPress:    [keycode(4BE), pressed(1)]
-//!   0x04 Scroll:      [dx(2BE), dy(2BE)]
-//!   0x05 CharInput:   [len(2BE), utf8_bytes]
-//!   0x06 Ping:        [timestamp(8BE)]
+//!   0x01 MouseMove   0x02 MouseButton  0x03 KeyPress
+//!   0x04 Scroll      0x06 Ping
+//!   0x07 MouseGlobal 0x08 KeyVk
 
 use anyhow::Result;
 use hbb_common::{log, tcp::FramedStream};
@@ -23,6 +21,7 @@ use std::{
 use crate::{
     decoder,
     display::{FrameBuffer, InputEvent},
+    vpx_dec::VpxDecoder,
 };
 
 // ── 타입 상수 ────────────────────────────────────────────────────────────────
@@ -34,8 +33,13 @@ const IN_MOUSE_MOVE:   u8 = 0x01;
 const IN_MOUSE_BUTTON: u8 = 0x02;
 const IN_KEY_PRESS:    u8 = 0x03;
 const IN_SCROLL:       u8 = 0x04;
-const IN_CHAR_INPUT:   u8 = 0x05;
 const IN_PING:         u8 = 0x06;
+const IN_MOUSE_GLOBAL: u8 = 0x07;
+const IN_KEY_VK:       u8 = 0x08;
+
+// ── 코덱 타입 ────────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Codec { Jpeg, Vp9 }
 
 // ── 세션 루프 ────────────────────────────────────────────────────────────────
 
@@ -46,16 +50,20 @@ pub async fn run(
 ) -> Result<()> {
     log::info!("[session] Viewer 세션 시작");
 
-    // 5초 주기 Ping (RTT 측정)
+    // VP9 디코더 (Init에서 codec=VP9 확인 후 초기화)
+    let mut decoder: Option<VpxDecoder> = None;
+    let mut codec = Codec::Vp9; // 기본값
+
     let mut ping_tick = tokio::time::interval(std::time::Duration::from_secs(5));
-    ping_tick.tick().await; // 첫 tick 즉시 소모
+    ping_tick.tick().await;
 
     loop {
         tokio::select! {
-            // ── 에이전트 메시지 수신 ─────────────────────────────────────────
             recv = stream.next() => {
                 match recv {
-                    Some(Ok(bytes)) => handle_agent_msg(&bytes, &frame_tx),
+                    Some(Ok(bytes)) => {
+                        handle_agent_msg(&bytes, &frame_tx, &mut decoder, &mut codec);
+                    }
                     Some(Err(e)) => {
                         log::warn!("[session] 수신 오류: {:?}", e);
                         break;
@@ -66,7 +74,6 @@ pub async fn run(
                     }
                 }
             }
-            // ── 입력 이벤트 → 에이전트 송신 ─────────────────────────────────
             Some(input) = input_rx.recv() => {
                 if let Some(data) = input_to_bytes(input) {
                     if let Err(e) = stream.send_bytes(bytes::Bytes::from(data)).await {
@@ -75,7 +82,6 @@ pub async fn run(
                     }
                 }
             }
-            // ── 주기적 Ping ──────────────────────────────────────────────────
             _ = ping_tick.tick() => {
                 let ts = now_ms();
                 let mut data = vec![IN_PING];
@@ -94,30 +100,72 @@ pub async fn run(
 
 // ── 에이전트 메시지 파싱 ─────────────────────────────────────────────────────
 
-fn handle_agent_msg(bytes: &[u8], frame_tx: &mpsc::SyncSender<FrameBuffer>) {
-    if bytes.is_empty() {
-        return;
-    }
+fn handle_agent_msg(
+    bytes: &[u8],
+    frame_tx: &mpsc::SyncSender<FrameBuffer>,
+    decoder: &mut Option<VpxDecoder>,
+    codec: &mut Codec,
+) {
+    if bytes.is_empty() { return; }
+
     match bytes[0] {
         MSG_INIT if bytes.len() >= 9 => {
             let w   = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
             let h   = u32::from_be_bytes(bytes[5..9].try_into().unwrap());
-            let fps = bytes.get(9).copied().unwrap_or(30);
-            log::info!("[session] Init: {}x{} @{}fps", w, h, fps);
+            let fps = bytes.get(9).copied().unwrap_or(60);
+            let c   = bytes.get(10).copied().unwrap_or(1);
+
+            *codec = if c == 1 { Codec::Vp9 } else { Codec::Jpeg };
+            log::info!("[session] Init: {}x{} @{}fps codec={} ({})",
+                w, h, fps, c, if *codec == Codec::Vp9 { "VP9" } else { "JPEG" });
+
+            if *codec == Codec::Vp9 {
+                match VpxDecoder::new() {
+                    Ok(dec) => {
+                        *decoder = Some(dec);
+                        log::info!("[session] VP9 디코더 초기화 완료");
+                    }
+                    Err(e) => log::error!("[session] VP9 디코더 초기화 실패: {:?}", e),
+                }
+            } else {
+                *decoder = None;
+                log::info!("[session] JPEG 폴백 모드");
+            }
         }
-        MSG_FRAME if bytes.len() >= 5 => {
-            let jpeg_len = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
-            if bytes.len() < 5 + jpeg_len {
+
+        // Frame: [is_key(1), data_len(4BE), frame_data]
+        MSG_FRAME if bytes.len() >= 6 => {
+            let _is_key  = bytes[1] != 0;
+            let data_len = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
+            if bytes.len() < 6 + data_len {
                 log::warn!("[session] 프레임 데이터 부족");
                 return;
             }
-            match decoder::decode_jpeg(&bytes[5..5 + jpeg_len]) {
-                Ok((w, h, pixels)) => {
-                    let _ = frame_tx.try_send(FrameBuffer { pixels, width: w, height: h });
+            let frame_data = &bytes[6..6 + data_len];
+
+            match codec {
+                Codec::Vp9 => {
+                    if let Some(dec) = decoder.as_mut() {
+                        match dec.decode(frame_data) {
+                            Ok(Some((w, h, pixels))) => {
+                                let _ = frame_tx.try_send(FrameBuffer { pixels, width: w, height: h });
+                            }
+                            Ok(None) => {}
+                            Err(e)   => log::warn!("[session] VP9 디코딩 오류: {:?}", e),
+                        }
+                    }
                 }
-                Err(e) => log::warn!("[session] JPEG 디코딩 실패: {:?}", e),
+                Codec::Jpeg => {
+                    match decoder::decode_jpeg(frame_data) {
+                        Ok((w, h, pixels)) => {
+                            let _ = frame_tx.try_send(FrameBuffer { pixels, width: w, height: h });
+                        }
+                        Err(e) => log::warn!("[session] JPEG 디코딩 오류: {:?}", e),
+                    }
+                }
             }
         }
+
         MSG_PONG if bytes.len() >= 9 => {
             let sent = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
             let rtt  = now_ms().saturating_sub(sent);
@@ -139,6 +187,12 @@ fn input_to_bytes(input: InputEvent) -> Option<Vec<u8>> {
             d.extend_from_slice(&(win_h as u16).to_be_bytes());
             Some(d)
         }
+        InputEvent::MouseMoveGlobal { gx, gy } => {
+            let mut d = vec![IN_MOUSE_GLOBAL];
+            d.extend_from_slice(&gx.to_be_bytes());
+            d.extend_from_slice(&gy.to_be_bytes());
+            Some(d)
+        }
         InputEvent::MouseButton { button, pressed } => {
             Some(vec![IN_MOUSE_BUTTON, button as u8, pressed as u8])
         }
@@ -154,14 +208,12 @@ fn input_to_bytes(input: InputEvent) -> Option<Vec<u8>> {
             d.extend_from_slice(&dy.to_be_bytes());
             Some(d)
         }
-        InputEvent::CharInput { text } => {
-            let bytes = text.as_bytes();
-            if bytes.len() > u16::MAX as usize {
-                return None;
-            }
-            let mut d = vec![IN_CHAR_INPUT];
-            d.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-            d.extend_from_slice(bytes);
+        InputEvent::KeyVk { vk, scan, pressed, extended } => {
+            let mut d = vec![IN_KEY_VK];
+            d.extend_from_slice(&vk.to_be_bytes());
+            d.extend_from_slice(&scan.to_be_bytes());
+            d.push(pressed as u8);
+            d.push(extended as u8);
             Some(d)
         }
     }

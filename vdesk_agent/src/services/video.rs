@@ -1,155 +1,222 @@
-//! 화면 캡처 + JPEG 압축 → VideoFrame → mpsc 채널
+//! 화면 캡처 + VP9 인코딩 → VideoFrame → mpsc 채널
 //!
-//! 품질 전략:
-//!   - FPS 30 (기본), 채널 포화 시 점진적 감소
-//!   - FNV-1a 샘플 해시로 변화 없는 프레임 전송 스킵
-//!   - 채널 백프레셔 기반 적응형 JPEG 품질 (40 ~ 85)
-//!   - RGB 변환 버퍼 재사용으로 heap 할당 최소화
+//! 파이프라인:
+//!   DXGI Desktop Duplication (BGRA)
+//!     → BGRA→I420 변환 (순수 Rust)
+//!     → VP9 인코딩 (libvpx, C 래퍼)
+//!     → try_send → 세션 루프
+//!
+//! 폴백: DXGI 초기화 실패 시 → JPEG (screenshots 대신 winapi GDI BitBlt 사용 불가,
+//!       단순히 오류 반환)
 
 use anyhow::Result;
 use hbb_common::log;
-use image::{codecs::jpeg::JpegEncoder, ColorType, ImageEncoder};
-use screenshots::Screen;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-pub const TARGET_FPS: u64 = 30;
-const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / TARGET_FPS);
+use super::{
+    capture_dxgi::DxgiCapture,
+    vpx_enc::VpxEncoder,
+    yuv::bgra_to_i420,
+};
 
-// 적응형 JPEG 품질 파라미터
-const QUALITY_MAX:  u8 = 85;
-const QUALITY_MIN:  u8 = 40;
-const QUALITY_DOWN: u8 = 10; // 채널 포화 시 품질 감소 폭
-const QUALITY_UP:   u8 = 2;  // 채널 여유 시 품질 회복 폭
+pub const TARGET_FPS: u64 = 60;
+const FRAME_INTERVAL: Duration = Duration::from_micros(1_000_000 / TARGET_FPS);
+
+// JPEG 폴백 품질 (0-100)
+const JPEG_QUALITY: u8 = 80;
+
+// VP9 비트레이트 (kbps): 1080p 원격 데스크톱 권장값
+const BITRATE_KBPS: u32 = 3000;
+
+// ── VideoFrame ───────────────────────────────────────────────────────────────
+
+/// 코덱 종류 (Init 메시지로 뷰어에 전달)
+#[derive(Clone, Copy, Debug)]
+pub enum Codec {
+    Jpeg = 0,
+    Vp9  = 1,
+}
 
 pub struct VideoFrame {
-    pub jpeg:   Vec<u8>,
-    pub width:  u32,
-    pub height: u32,
-    pub fps:    u8,
+    pub data:      Vec<u8>,
+    pub width:     u32,
+    pub height:    u32,
+    pub fps:       u8,
+    pub codec:     Codec,
+    pub is_key:    bool,
+}
+
+// ── Windows 고해상도 타이머 ───────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+mod timer {
+    use winapi::um::timeapi::{timeBeginPeriod, timeEndPeriod};
+    pub fn begin() { unsafe { timeBeginPeriod(1); } }
+    pub fn end()   { unsafe { timeEndPeriod(1); } }
+}
+#[cfg(not(target_os = "windows"))]
+mod timer {
+    pub fn begin() {}
+    pub fn end()   {}
+}
+
+// ── FNV 샘플 해시 (변화 없는 프레임 스킵) ──────────────────────────────────
+
+fn fnv_sample(data: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME:  u64 = 0x100000001b3;
+    let mut h = OFFSET;
+    for &b in data.iter().step_by(256) {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
+// ── 캡처 루프 ────────────────────────────────────────────────────────────────
+
+/// BGRA 슬라이스를 JPEG 바이트로 인코딩
+fn encode_jpeg(bgra: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
+    use image::{codecs::jpeg::JpegEncoder, ImageBuffer, Rgb};
+    let rgb: Vec<u8> = bgra.chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0]])
+        .collect();
+    let img = ImageBuffer::<Rgb<u8>, _>::from_raw(w, h, rgb)
+        .ok_or_else(|| anyhow::anyhow!("이미지 버퍼 생성 실패"))?;
+    let mut out = Vec::new();
+    let mut enc = JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
+    enc.encode_image(&img)?;
+    Ok(out)
 }
 
 /// 화면 캡처 루프 — spawn_blocking 안에서 동기 실행
 pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result<()> {
     log::info!("[video] 캡처 시작: {}", session_key);
 
-    let screens = Screen::all()?;
-    let screen = screens
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("디스플레이를 찾을 수 없습니다"))?;
+    timer::begin();
 
-    let di = screen.display_info;
-    log::info!("[video] {}x{} @{}fps", di.width, di.height, TARGET_FPS);
+    // DXGI 캡처 초기화
+    let mut capture = DxgiCapture::new().map_err(|e| {
+        log::error!("[video] DXGI 초기화 실패: {:?}", e);
+        e
+    })?;
 
-    let mut quality   = QUALITY_MAX;
-    let mut last_hash = 0u64;
-    let mut frames    = 0u64;
-    let mut last_tick = Instant::now();
+    let w = capture.width;
+    let h = capture.height;
+    log::info!("[video] {}x{} DXGI 캡처 초기화 완료", w, h);
 
-    // 재사용 버퍼: RGBA → RGB 변환용 (heap 재할당 방지)
-    let mut rgb_buf = Vec::<u8>::with_capacity((di.width * di.height * 3) as usize);
-    // JPEG 출력 크기 힌트 (이전 프레임 크기로 초기화 → 재할당 감소)
-    let mut jpeg_size_hint = (di.width * di.height / 4) as usize;
+    // VP9 인코더 초기화 (실패 시 JPEG 폴백)
+    let mut encoder: Option<VpxEncoder> = match VpxEncoder::new(w, h, BITRATE_KBPS, TARGET_FPS as u32) {
+        Ok(enc) => {
+            log::info!("[video] VP9 인코더 초기화 완료 ({}kbps, {}fps)", BITRATE_KBPS, TARGET_FPS);
+            Some(enc)
+        }
+        Err(e) => {
+            log::warn!("[video] VP9 인코더 초기화 실패: {:?}", e);
+            log::warn!("[video] ★ JPEG 폴백 모드로 전환 (품질: {})", JPEG_QUALITY);
+            None
+        }
+    };
+
+    let mut i420_buf: Vec<u8> = Vec::new();
+    let mut last_hash: u64    = 0;
+    let mut frames: u64       = 0;
+    let mut drop_count: u32   = 0;
+    let mut last_tick         = Instant::now();
 
     loop {
         if tx.is_closed() {
             break;
         }
 
-        // ── FPS 제한 ──────────────────────────────────────────────────────
+        // FPS 제한
         let elapsed = last_tick.elapsed();
         if elapsed < FRAME_INTERVAL {
             std::thread::sleep(FRAME_INTERVAL - elapsed);
         }
         last_tick = Instant::now();
 
-        // ── 화면 캡처 ────────────────────────────────────────────────────
-        let cap = match screen.capture() {
-            Ok(c) => c,
+        // DXGI 캡처
+        let bgra = match capture.capture() {
+            Ok(Some(b)) => b,
+            Ok(None)    => continue, // 변화 없음
             Err(e) => {
-                log::warn!("[video] 캡처 오류: {:?}", e);
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
+                log::warn!("[video] DXGI 캡처 오류: {:?} — 재초기화 시도", e);
+                std::thread::sleep(Duration::from_millis(200));
+                match DxgiCapture::new() {
+                    Ok(c) => {
+                        capture = c;
+                        log::info!("[video] DXGI 재초기화 성공");
+                        continue;
+                    }
+                    Err(e2) => {
+                        log::error!("[video] DXGI 재초기화 실패: {:?}", e2);
+                        std::thread::sleep(Duration::from_millis(1000));
+                        continue;
+                    }
+                }
             }
         };
 
-        let rgba = cap.as_raw();
-        let w    = cap.width();
-        let h    = cap.height();
-
-        // ── 변화 감지: FNV 샘플 해시 (변화 없는 프레임 스킵) ─────────────
-        let hash = fnv_sample(rgba);
-        if hash == last_hash {
-            continue;
-        }
+        // 변화 감지 (FNV 샘플 해시)
+        let hash = fnv_sample(bgra);
+        let is_static = hash == last_hash;
         last_hash = hash;
 
-        // ── 적응형 품질 조절 (채널 용량 기반) ────────────────────────────
-        //   tx.capacity() = 남은 공간 / tx.max_capacity() = 최대 용량
-        let remaining = tx.capacity();
-        let max_cap   = tx.max_capacity();
-        if remaining == 0 {
-            // 채널 꽉 참 → 품질 빠르게 낮춤
-            quality = quality.saturating_sub(QUALITY_DOWN).max(QUALITY_MIN);
-        } else if remaining == max_cap && quality < QUALITY_MAX {
-            // 채널 완전 비어 있음 → 품질 천천히 회복
-            quality = (quality + QUALITY_UP).min(QUALITY_MAX);
-        }
-
-        // ── RGBA → RGB 변환 (버퍼 재사용) ───────────────────────────────
-        let needed = (w * h * 3) as usize;
-        rgb_buf.clear();
-        if rgb_buf.capacity() < needed {
-            rgb_buf.reserve(needed - rgb_buf.capacity());
-        }
-        for px in rgba.chunks_exact(4) {
-            rgb_buf.push(px[0]);
-            rgb_buf.push(px[1]);
-            rgb_buf.push(px[2]);
-        }
-
-        // ── JPEG 인코딩 (크기 힌트로 재할당 최소화) ──────────────────────
-        let mut jpeg_buf = Vec::with_capacity(jpeg_size_hint);
-        if let Err(e) = JpegEncoder::new_with_quality(&mut jpeg_buf, quality)
-            .write_image(&rgb_buf, w, h, ColorType::Rgb8.into())
-        {
-            log::warn!("[video] JPEG 인코딩 오류: {:?}", e);
+        let force_key = frames % (TARGET_FPS * 3) == 0;
+        if is_static && !force_key {
             continue;
         }
-        jpeg_size_hint = jpeg_buf.len(); // 다음 프레임 힌트 업데이트
 
-        if tx.blocking_send(VideoFrame {
-            jpeg:   jpeg_buf,
-            width:  w,
+        // ── 인코딩 ──────────────────────────────────────────────────────────
+        let (encoded, codec, is_key) = if let Some(enc) = encoder.as_mut() {
+            // VP9 경로
+            bgra_to_i420(bgra, w as usize, h as usize, &mut i420_buf);
+            match enc.encode(&i420_buf, force_key) {
+                Ok(Some((d, k))) => (d.to_vec(), Codec::Vp9, k),
+                Ok(None)         => continue,
+                Err(e) => {
+                    log::warn!("[video] VP9 인코딩 오류: {:?}", e);
+                    continue;
+                }
+            }
+        } else {
+            // JPEG 폴백 경로
+            match encode_jpeg(bgra, w, h) {
+                Ok(d) => (d, Codec::Jpeg, true),
+                Err(e) => {
+                    log::warn!("[video] JPEG 인코딩 오류: {:?}", e);
+                    continue;
+                }
+            }
+        };
+
+        match tx.try_send(VideoFrame {
+            data: encoded,
+            width: w,
             height: h,
-            fps:    TARGET_FPS as u8,
-        })
-        .is_err()
-        {
-            break;
+            fps: TARGET_FPS as u8,
+            codec,
+            is_key,
+        }) {
+            Ok(_) => { drop_count = 0; }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                drop_count += 1;
+                if drop_count % 10 == 0 {
+                    log::debug!("[video] 채널 포화 드롭 {}회", drop_count);
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
         }
 
         frames += 1;
         if frames % 300 == 0 {
-            log::debug!("[video] {}프레임 전송 (quality={})", frames, quality);
+            log::debug!("[video] {}프레임 전송 (코덱: {:?})", frames, if encoder.is_some() { "VP9" } else { "JPEG" });
         }
     }
 
+    timer::end();
     log::info!("[video] 캡처 루프 종료");
     Ok(())
-}
-
-/// FNV-1a 기반 프레임 샘플 해시
-/// 128바이트(32픽셀×4채널)마다 1바이트 샘플 → 전체 픽셀의 ~0.8% 검사
-/// 의존성 없이 충분히 빠르고 충돌률이 낮음
-fn fnv_sample(data: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME:  u64 = 0x100000001b3;
-    let mut h = FNV_OFFSET;
-    for &b in data.iter().step_by(128) {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
 }
