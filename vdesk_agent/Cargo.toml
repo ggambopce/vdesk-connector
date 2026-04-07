@@ -1,0 +1,32 @@
+[package]
+name = "vdesk_agent"
+version = "0.1.0"
+edition = "2021"
+description = "VDesk VM Agent — registers with backend, streams screen/audio, accepts direct TCP viewer connections"
+
+[[bin]]
+name = "vdesk_agent"
+path = "src/main.rs"
+
+[dependencies]
+hbb_common = { path = "../vdesk_client/vdesk_client/libs/hbb_common" }
+bytes = "1"
+
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+protobuf = { version = "3.7", features = ["with-bytes"] }
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1.0"
+chrono = "0.4"
+
+# 화면 캡처 (순수 Rust, native binding 불필요)
+screenshots = "0.8"
+# JPEG 인코딩
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = ["winsock2", "iphlpapi", "winuser"] }

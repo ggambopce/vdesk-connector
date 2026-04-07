@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "vdesk_agent",
+    "vdesk_viewer",
+]
+resolver = "2"
