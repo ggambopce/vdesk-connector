@@ -241,14 +241,21 @@ mod win {
             flags |= KEYEVENTF_EXTENDEDKEY;
         }
 
+        // VK → scan code 변환 (MapVirtualKey) — scan code 없이 VK만 보내면
+        // 일부 앱에서 오작동하므로 scan code도 같이 전달한다.
+        let scan = unsafe {
+            extern "system" { fn MapVirtualKeyW(uCode: u32, uMapType: u32) -> u32; }
+            MapVirtualKeyW(vk, 0) as u16 // MAPVK_VK_TO_VSC = 0
+        };
+
         unsafe {
             let mut inp: INPUT = mem::zeroed();
             inp.type_ = INPUT_KEYBOARD;
             *inp.u.ki_mut() = KEYBDINPUT {
-                wVk: vk as u16,
-                wScan: 0,
-                dwFlags: flags,
-                time: 0,
+                wVk:         vk as u16,
+                wScan:       scan,
+                dwFlags:     flags,
+                time:        0,
                 dwExtraInfo: VDESK_INPUT_MARK,
             };
             SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);

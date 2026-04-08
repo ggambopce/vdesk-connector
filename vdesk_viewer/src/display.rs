@@ -78,12 +78,10 @@ struct ViewerApp {
     /// true면 MouseMoveGlobal 전송 (VDESK_DIRECT / VDESK_MOUSE_GLOBAL)
     mouse_global: bool,
 
-    // ── 스케일링 캐시 ────────────────────────────────────────────────────────
-    /// x축 소스 인덱스 사전 계산 테이블 — 창 크기/프레임 크기 변경 시에만 재계산
-    /// 픽셀당 나눗셈을 제거하여 렌더링 CPU 부하 감소
-    x_map: Vec<u32>,
-    /// x_map을 계산한 시점의 (dst_w, src_w)
-    x_map_key: (u32, u32),
+    // ── 스크롤 오프셋 ────────────────────────────────────────────────────────
+    /// 프레임 내 뷰포트 좌상단 위치 (픽셀). 창이 프레임보다 작을 때 패닝에 사용.
+    scroll_x: u32,
+    scroll_y: u32,
 }
 
 impl ApplicationHandler<ViewerEvent> for ViewerApp {
@@ -128,7 +126,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             // 창 크기 변경: surface 재조정 + 리드로우
             WindowEvent::Resized(size) => {
                 self.window_size = (size.width.max(1), size.height.max(1));
-                self.surface_size = (0, 0); // 캐시 무효화
+                self.surface_size = (0, 0);
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -181,20 +179,45 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
 
             // ── 스크롤 휠 ───────────────────────────────────────────────────
             WindowEvent::MouseWheel { delta, .. } => {
-                if is_agent_injected() { return; } // 에이전트 주입 이벤트 무시
-                if !self.control_active {
-                    return;
-                }
-                if let Some(tx) = &self.input_tx {
-                    let (dx, dy) = match delta {
-                        MouseScrollDelta::LineDelta(x, y) => {
-                            ((x * 120.0) as i16, (y * 120.0) as i16)
-                        }
-                        MouseScrollDelta::PixelDelta(pos) => {
-                            (pos.x as i16, pos.y as i16)
-                        }
-                    };
-                    let _ = tx.send(InputEvent::Scroll { dx, dy });
+                if is_agent_injected() { return; }
+
+                let (raw_dx, raw_dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        ((x * 120.0) as i32, (y * 120.0) as i32)
+                    }
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        (pos.x as i32, pos.y as i32)
+                    }
+                };
+
+                if self.control_active {
+                    // 제어 모드: 원격 PC로 스크롤 전달
+                    if let Some(tx) = &self.input_tx {
+                        let _ = tx.send(InputEvent::Scroll {
+                            dx: raw_dx as i16,
+                            dy: raw_dy as i16,
+                        });
+                    }
+                } else {
+                    // 비제어 모드: 뷰포트 패닝
+                    // dy 양수 = 위로 스크롤(=뷰 위로 이동), 음수 = 아래
+                    let scroll_step = 80i32;
+                    let step_x = if raw_dx != 0 { raw_dx.signum() * scroll_step } else { 0 };
+                    let step_y = if raw_dy != 0 { raw_dy.signum() * scroll_step } else { 0 };
+
+                    let max_sx = self.current_frame.as_ref()
+                        .map_or(0, |f| f.width.saturating_sub(self.window_size.0));
+                    let max_sy = self.current_frame.as_ref()
+                        .map_or(0, |f| f.height.saturating_sub(self.window_size.1));
+
+                    self.scroll_x = (self.scroll_x as i32 - step_x)
+                        .clamp(0, max_sx as i32) as u32;
+                    self.scroll_y = (self.scroll_y as i32 - step_y)
+                        .clamp(0, max_sy as i32) as u32;
+
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
                 }
             }
 
@@ -269,6 +292,7 @@ impl ViewerApp {
     fn send_pointer_move(&mut self, x: i32, y: i32) {
         let Some(tx) = &self.input_tx else { return };
         if self.mouse_global {
+            // 같은 PC 모드: 가상 화면 절대 좌표 — 스크롤 오프셋 불필요
             if let Some(w) = &self.window {
                 if let Ok(origin) = w.inner_position() {
                     let gx = origin.x + x;
@@ -278,18 +302,28 @@ impl ViewerApp {
                 }
             }
         }
-        let (ww, wh) = self.window_size;
+        // 원격 PC 모드: 창 좌표 + 스크롤 오프셋 = 프레임 실제 좌표
+        // 에이전트는 (fx, fy, frame_w, frame_h)로 screen 좌표를 계산:
+        //   screen_x = fx * screen_w / frame_w
+        // frame_w == screen_w 이므로 screen_x = fx = x + scroll_x (정확)
+        let frame_w = self.current_frame.as_ref().map_or(self.window_size.0, |f| f.width);
+        let frame_h = self.current_frame.as_ref().map_or(self.window_size.1, |f| f.height);
+        let fx = (x + self.scroll_x as i32).clamp(0, frame_w as i32 - 1);
+        let fy = (y + self.scroll_y as i32).clamp(0, frame_h as i32 - 1);
         let _ = tx.send(InputEvent::MouseMove {
-            x,
-            y,
-            win_w: ww,
-            win_h: wh,
+            x:     fx,
+            y:     fy,
+            win_w: frame_w,
+            win_h: frame_h,
         });
     }
 
     /// 원격 제어 모드 활성화
     fn activate_control_mode(&mut self) {
         let Some(window) = &self.window else { return };
+
+        // 진입 시 에이전트 입력 상태 초기화 — 이전 세션에서 고착된 키/버튼이 있어도 해제
+        self.release_all_inputs();
 
         // 커서를 창 안에 가둠 (VM 제어 시 실수 클릭 방지)
         if let Err(e) = window.set_cursor_grab(CursorGrabMode::Confined) {
@@ -314,7 +348,12 @@ impl ViewerApp {
     fn deactivate_control_mode(&mut self) {
         let Some(window) = &self.window else { return };
 
+        // 훅 제거 전 모든 입력 강제 해제
+        // — 수정 키·마우스 버튼을 누른 채 ESC 를 누르면 훅이 사라져 keyup/mouseup 이
+        //   에이전트에 전달되지 않아 입력이 고착된다. 미리 해제 이벤트를 보낸다.
+        self.release_all_inputs();
         self.remove_kb_hook();
+
         let _ = window.set_cursor_grab(CursorGrabMode::None);
         window.set_cursor(CursorIcon::Default);
         window.set_title("VDesk Viewer — 클릭하여 원격 제어");
@@ -322,6 +361,41 @@ impl ViewerApp {
         window.request_redraw(); // 녹색 테두리 즉시 제거
 
         hbb_common::log::info!("[display] 원격 제어 모드 OFF");
+    }
+
+    /// 에이전트에 모든 수정 키·마우스 버튼 해제 이벤트 전송
+    ///
+    /// 제어 모드 진입/해제 양쪽에서 호출해 에이전트 입력 상태를 항상 클린하게 유지한다.
+    fn release_all_inputs(&self) {
+        let Some(tx) = &self.input_tx else { return };
+
+        // ── 수정 키 해제 ────────────────────────────────────────────────────
+        // (VK 코드, extended 여부)
+        const MODS: &[(u32, bool)] = &[
+            (0xA0, false), // VK_LSHIFT
+            (0xA1, false), // VK_RSHIFT
+            (0xA2, false), // VK_LCONTROL
+            (0xA3, true),  // VK_RCONTROL  (extended)
+            (0xA4, false), // VK_LMENU  (LAlt)
+            (0xA5, true),  // VK_RMENU  (RAlt, extended)
+            (0x5B, true),  // VK_LWIN   (extended)
+            (0x5C, true),  // VK_RWIN   (extended)
+        ];
+        for &(vk, extended) in MODS {
+            let _ = tx.send(InputEvent::KeyVk {
+                vk,
+                scan: 0,
+                pressed: false,
+                extended,
+            });
+        }
+
+        // ── 마우스 버튼 해제 ────────────────────────────────────────────────
+        for btn in [0u32, 2, 4] { // Left, Right, Middle
+            let _ = tx.send(InputEvent::MouseButton { button: btn, pressed: false });
+        }
+
+        hbb_common::log::debug!("[display] 모든 입력 강제 해제 전송");
     }
 
     /// 글로벌 키보드 훅 설치 (Windows 전용)
@@ -378,20 +452,33 @@ impl ViewerApp {
             }
         }
 
-        // x축 인덱스 맵 캐시 갱신 (창 크기 or 프레임 크기 변경 시에만)
-        let x_key = (win_w, frame.width);
-        if self.x_map_key != x_key {
-            self.x_map = (0..win_w).map(|dx| dx * frame.width / win_w).collect();
-            self.x_map_key = x_key;
-        }
+        // 스크롤 범위 클램프 (창 크기/프레임 크기 변동 대응)
+        let max_sx = frame.width.saturating_sub(win_w);
+        let max_sy = frame.height.saturating_sub(win_h);
+        self.scroll_x = self.scroll_x.min(max_sx);
+        self.scroll_y = self.scroll_y.min(max_sy);
+
+        // 프레임이 창보다 작을 때 중앙 정렬 오프셋
+        let off_x = if frame.width  < win_w { (win_w - frame.width)  / 2 } else { 0 };
+        let off_y = if frame.height < win_h { (win_h - frame.height) / 2 } else { 0 };
 
         if let Ok(mut buf) = surface.buffer_mut() {
-            // 프레임을 창 크기에 맞게 스케일링
-            scale_pixels(
+            // 1:1 픽셀 복사 (스케일링 없음) — 창보다 큰 영역은 스크롤로 패닝
+            blit_frame(
                 &frame.pixels, frame.width, frame.height,
                 &mut buf,      win_w,       win_h,
-                &self.x_map,
+                self.scroll_x, self.scroll_y,
+                off_x,         off_y,
             );
+
+            // 스크롤바 표시 (스크롤이 필요한 경우)
+            if frame.width > win_w || frame.height > win_h {
+                draw_scrollbars(
+                    &mut buf, win_w, win_h,
+                    frame.width, frame.height,
+                    self.scroll_x, self.scroll_y,
+                );
+            }
 
             // 원격 제어 모드 활성 시 녹색 테두리 오버레이
             if self.control_active {
@@ -403,31 +490,109 @@ impl ViewerApp {
     }
 }
 
-/// 프레임을 창 크기에 맞게 최근접 스케일링 (꽉 채움)
+/// 프레임을 1:1 픽셀 비율로 복사 (스케일링 없음)
 ///
-/// x_map: 호출자가 캐싱한 x축 소스 인덱스 테이블 (dst_w 길이)
-/// 픽셀당 나눗셈을 dst_w + dst_h 번으로 줄임 (기존 dst_w × dst_h 번)
-fn scale_pixels(
+/// - 창이 프레임보다 클 때: `off_x / off_y` 만큼 중앙 정렬, 나머지는 검정
+/// - 창이 프레임보다 작을 때: `scroll_x / scroll_y` 위치부터 창 크기만큼 표시
+fn blit_frame(
     src: &[u32], src_w: u32, src_h: u32,
     dst: &mut [u32], dst_w: u32, dst_h: u32,
-    x_map: &[u32],
+    scroll_x: u32, scroll_y: u32,
+    off_x: u32, off_y: u32,
 ) {
-    if src_w == 0 || src_h == 0 {
-        return;
-    }
-    // 동일 크기: memcpy fast path
-    if src_w == dst_w && src_h == dst_h {
-        dst.copy_from_slice(src);
-        return;
-    }
+    if src_w == 0 || src_h == 0 { return; }
+
     let dst_w_us = dst_w as usize;
+
     for dy in 0..dst_h {
-        let src_row = (dy * src_h / dst_h) as usize * src_w as usize;
-        let dst_off = dy as usize * dst_w_us;
-        let src_slice = &src[src_row..];
-        let dst_row   = &mut dst[dst_off..dst_off + dst_w_us];
-        for (dst_px, &sx) in dst_row.iter_mut().zip(x_map.iter()) {
-            *dst_px = src_slice[sx as usize];
+        let dst_row = &mut dst[dy as usize * dst_w_us..(dy as usize + 1) * dst_w_us];
+
+        // 위/아래 여백 (프레임이 창보다 작아 중앙 정렬된 경우)
+        if dy < off_y || dy >= off_y + src_h {
+            dst_row.fill(0);
+            continue;
+        }
+
+        let fy = (dy - off_y + scroll_y) as usize;
+        if fy >= src_h as usize {
+            dst_row.fill(0);
+            continue;
+        }
+
+        // 왼쪽 여백
+        let left = off_x as usize;
+        if left > 0 {
+            dst_row[..left.min(dst_w_us)].fill(0);
+        }
+
+        // 프레임 픽셀 복사
+        let fx_start = scroll_x as usize;
+        let frame_avail = src_w as usize - fx_start;      // 프레임에서 꺼낼 수 있는 너비
+        let dst_avail   = dst_w_us.saturating_sub(left);  // 목적지 남은 너비
+        let copy_w      = frame_avail.min(dst_avail);
+
+        if copy_w > 0 {
+            let src_off = fy * src_w as usize + fx_start;
+            dst_row[left..left + copy_w].copy_from_slice(&src[src_off..src_off + copy_w]);
+        }
+
+        // 오른쪽 여백
+        let right_start = left + copy_w;
+        if right_start < dst_w_us {
+            dst_row[right_start..].fill(0);
+        }
+    }
+}
+
+/// 스크롤바 오버레이 (반투명 효과 없이 단색)
+///
+/// - 수직 스크롤바: 우측 8px
+/// - 수평 스크롤바: 하단 8px
+/// - 썸(thumb): 밝은 회색, 트랙: 어두운 회색
+fn draw_scrollbars(
+    buf: &mut softbuffer::Buffer<'_, Arc<Window>, Arc<Window>>,
+    win_w: u32, win_h: u32,
+    frame_w: u32, frame_h: u32,
+    scroll_x: u32, scroll_y: u32,
+) {
+    const BAR:   u32 = 8;          // 스크롤바 두께 (px)
+    const THUMB: u32 = 0x00AAAAAA; // 썸 색상 (밝은 회색, XRGB)
+    const TRACK: u32 = 0x00333333; // 트랙 색상 (어두운 회색)
+
+    let need_h = frame_w > win_w;
+    let need_v = frame_h > win_h;
+
+    // 수직 스크롤바 (우측)
+    if need_v {
+        let track_h = if need_h { win_h.saturating_sub(BAR) } else { win_h };
+        let max_sy  = frame_h - win_h;
+        let thumb_h = ((track_h as u64 * win_h as u64 / frame_h as u64) as u32).max(20).min(track_h);
+        let thumb_y = (scroll_y as u64 * (track_h - thumb_h) as u64 / max_sy as u64) as u32;
+
+        let bar_x = win_w.saturating_sub(BAR);
+        for y in 0..track_h {
+            let color = if y >= thumb_y && y < thumb_y + thumb_h { THUMB } else { TRACK };
+            for x in bar_x..win_w {
+                let idx = (y * win_w + x) as usize;
+                if idx < buf.len() { buf[idx] = color; }
+            }
+        }
+    }
+
+    // 수평 스크롤바 (하단)
+    if need_h {
+        let track_w = if need_v { win_w.saturating_sub(BAR) } else { win_w };
+        let max_sx  = frame_w - win_w;
+        let thumb_w = ((track_w as u64 * win_w as u64 / frame_w as u64) as u32).max(20).min(track_w);
+        let thumb_x = (scroll_x as u64 * (track_w - thumb_w) as u64 / max_sx as u64) as u32;
+
+        let bar_y = win_h.saturating_sub(BAR);
+        for y in bar_y..win_h {
+            for x in 0..track_w {
+                let color = if x >= thumb_x && x < thumb_x + thumb_w { THUMB } else { TRACK };
+                let idx = (y * win_w + x) as usize;
+                if idx < buf.len() { buf[idx] = color; }
+            }
         }
     }
 }
@@ -573,8 +738,8 @@ pub fn run_event_loop(
         control_active:  false,
         last_cursor:     None,
         mouse_global,
-        x_map:           Vec::new(),
-        x_map_key:       (0, 0),
+        scroll_x:        0,
+        scroll_y:        0,
     };
 
     // Wait: 프레임/입력 이벤트가 있을 때만 루프 실행
