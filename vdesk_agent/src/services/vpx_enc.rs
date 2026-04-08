@@ -11,6 +11,7 @@ extern "C" {
     fn vpx_enc_create(w: i32, h: i32, bitrate_kbps: i32, fps: i32) -> *mut VpxEncHandle;
     fn vpx_enc_create_ex(w: i32, h: i32, bitrate_kbps: i32, fps: i32, out_err: *mut i32) -> *mut VpxEncHandle;
     fn vpx_enc_destroy(h: *mut VpxEncHandle);
+    fn vpx_enc_last_error() -> *const std::os::raw::c_char;
     fn vpx_enc_encode(
         h:         *mut VpxEncHandle,
         i420:      *const u8,
@@ -46,6 +47,14 @@ impl VpxEncoder {
             vpx_enc_create_ex(w as i32, h as i32, bitrate_kbps as i32, fps as i32, &mut err_code)
         };
         if handle.is_null() {
+            let detail = unsafe {
+                let p = vpx_enc_last_error();
+                if p.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(p).to_string_lossy().to_string()
+                }
+            };
             let reason = match err_code {
                 1 => "calloc 실패 (OOM)",
                 2 => "vpx_codec_enc_config_default 실패 (코덱 미지원?)",
@@ -53,7 +62,15 @@ impl VpxEncoder {
                 4 => "vpx_img_alloc 실패 (메모리 부족)",
                 _ => "알 수 없는 오류",
             };
-            return Err(anyhow!("vpx_enc_create 실패 [err={}]: {}", err_code, reason));
+            if detail.is_empty() {
+                return Err(anyhow!("vpx_enc_create 실패 [err={}]: {}", err_code, reason));
+            }
+            return Err(anyhow!(
+                "vpx_enc_create 실패 [err={}]: {} ({})",
+                err_code,
+                reason,
+                detail
+            ));
         }
         Ok(Self { handle })
     }

@@ -100,21 +100,19 @@ pub async fn listen_loop_direct(fixed_key: String) -> Result<()> {
         tcp_stream.set_nodelay(true).ok();
 
         let local_addr = tcp_stream.local_addr()?;
-        let key = fixed_key.clone();
 
-        tokio::spawn(async move {
-            let mut stream = FramedStream::from(tcp_stream, local_addr);
-            match handshake(&mut stream, &key).await {
-                Ok(session_key) => {
-                    log::info!("[server] 핸드쉐이크 성공 → 스트리밍 시작");
-                    if let Err(e) = crate::session::run(stream, session_key).await {
-                        log::error!("[session] 세션 오류: {:?}", e);
-                    }
-                    log::info!("[server] 세션 종료 — 다음 연결 대기");
+        // spawn 없이 인라인 실행 — 세션이 완전히 종료(DXGI 핸들 해제)된 후 다음 연결 수락
+        let mut stream = FramedStream::from(tcp_stream, local_addr);
+        match handshake(&mut stream, &fixed_key).await {
+            Ok(session_key) => {
+                log::info!("[server] 핸드쉐이크 성공 → 스트리밍 시작");
+                if let Err(e) = crate::session::run(stream, session_key).await {
+                    log::error!("[session] 세션 오류: {:?}", e);
                 }
-                Err(e) => log::warn!("[server] 핸드쉐이크 실패 ({}): {:?}", peer_addr, e),
+                log::info!("[server] 세션 종료 — 다음 연결 대기");
             }
-        });
+            Err(e) => log::warn!("[server] 핸드쉐이크 실패 ({}): {:?}", peer_addr, e),
+        }
     }
 }
 

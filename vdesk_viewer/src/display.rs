@@ -152,13 +152,14 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             // ── 마우스 버튼 ─────────────────────────────────────────────────
             WindowEvent::MouseInput { state, button, .. } => {
                 if is_agent_injected() { return; } // 에이전트 주입 이벤트 무시
-                // 비활성 상태에서 Left 클릭 → 원격 제어 모드 진입 (클릭 자체는 전달 안 함)
+                // 비활성 상태에서 Left 클릭 → 원격 제어 모드 진입
                 if !self.control_active
                     && button == MouseButton::Left
                     && state == ElementState::Pressed
                 {
                     self.activate_control_mode();
-                    return;
+                    // 첫 클릭도 바로 전달해서 "클릭이 안 먹는" 느낌을 없앰.
+                    // (release는 다음 이벤트에서 정상 전달됨)
                 }
 
                 // 활성 상태에서만 에이전트로 전달

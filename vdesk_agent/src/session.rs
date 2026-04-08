@@ -40,8 +40,8 @@ pub async fn run(mut stream: FramedStream, session_key: String) -> Result<()> {
     // 아웃바운드 제어 메시지 (Pong)
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(16);
 
-    // 화면 캡처 태스크
-    tokio::task::spawn_blocking({
+    // 화면 캡처 태스크 — JoinHandle 보관하여 종료 대기에 사용
+    let capture_handle = tokio::task::spawn_blocking({
         let tx = video_tx.clone();
         let key = session_key.clone();
         move || {
@@ -51,10 +51,17 @@ pub async fn run(mut stream: FramedStream, session_key: String) -> Result<()> {
         }
     });
 
+    // video_tx 원본 drop — capture task의 clone이 유일한 sender가 됨
+    // → capture task가 실패하면 recv()가 None을 반환해 영구 블록 방지
+    drop(video_tx);
+
     // 첫 프레임으로 화면 크기 파악 → Init 메시지 전송
     let first_frame = match video_rx.recv().await {
         Some(f) => f,
-        None => anyhow::bail!("[session] 첫 프레임 수신 실패"),
+        None => {
+            let _ = capture_handle.await;
+            anyhow::bail!("[session] 첫 프레임 수신 실패 (캡처 태스크 종료)")
+        }
     };
     send_init(&mut stream, &first_frame).await?;
     send_frame(&mut stream, &first_frame).await?;
@@ -83,6 +90,12 @@ pub async fn run(mut stream: FramedStream, session_key: String) -> Result<()> {
             }
         }
     }
+
+    // video_rx drop → capture_loop가 tx.is_closed()/TrySendError::Closed 감지 후 종료
+    // DXGI 핸들이 해제될 때까지 대기 — 재연결 시 새 DuplicateOutput 충돌 방지
+    drop(video_rx);
+    let _ = capture_handle.await;
+    log::info!("[session] 캡처 루프 종료 확인 — DXGI 핸들 해제됨");
 
     log::info!("[session] 세션 종료: {}", session_key);
     Ok(())

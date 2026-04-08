@@ -8,8 +8,8 @@ This is a Cargo workspace with two crates:
 
 | Path | Stack | Role |
 |------|-------|------|
-| `vdesk_agent/` | Rust (async Tokio) | Screen-streaming agent — TCP listener, JPEG capture, input injection |
-| `vdesk_viewer/` | Rust (sync + Tokio thread) | Remote viewer — winit window, JPEG decode, input capture |
+| `vdesk_agent/` | Rust (async Tokio) | Screen-streaming agent — TCP listener, VP9 capture, input injection |
+| `vdesk_viewer/` | Rust (sync + Tokio thread) | Remote viewer — winit window, VP9 decode, input capture |
 
 The `.vs/` directory is a Visual Studio workspace artifact. No VS project is wired up.
 
@@ -22,25 +22,26 @@ cargo build --release --package vdesk_viewer
 cargo check          # whole workspace
 ```
 
+VP9 requires **libvpx via vcpkg** (`x64-windows-static` triplet). Set `VCPKG_ROOT` before building if vcpkg is not at `C:\vcpkg`.
+
 ## Running — Direct Mode (no backend required)
 
-Two PowerShell scripts launch agent + viewer on the same PC for local UX testing:
-
 ```powershell
-# Terminal 1 — agent
+# Terminal 1 — agent (same PC)
 .\run_agent_direct.ps1          # default: port 20020, key "direct"
 
 # Terminal 2 — viewer
-.\run_viewer_direct.ps1         # connects to 127.0.0.1:20020
-.\run_viewer_direct.ps1 -AgentHost "192.168.1.100"   # remote agent
+.\run_viewer_direct.ps1                              # 127.0.0.1:20020
+.\run_viewer_direct.ps1 -AgentHost "192.168.1.100"  # remote agent
 ```
 
-Relevant env vars for direct mode:
+Relevant env vars:
 - `VDESK_DIRECT=1` — skip backend, use direct TCP
 - `VDESK_DIRECT_KEY` — shared session key (default: `"direct"`)
 - `VDESK_DIRECT_HOST` / `VDESK_DIRECT_PORT` — viewer-side target
 - `AGENT_PORT` — agent listen port (default: 20020)
 - `AGENT_NO_INJECT=1` — disable `SendInput` (streaming-only test)
+- `VDESK_MOUSE_GLOBAL=1` — send mouse as virtual-screen absolute coords (0x07) even in backend mode
 
 ## Running — Backend Mode
 
@@ -55,76 +56,118 @@ $env:VDESK_PASSWORD="pass"
 .\target\release\vdesk_viewer.exe --device 42
 ```
 
+## Distribution (viewer only)
+
+`target/release/vdesk_viewer.exe` is a single-file distribution (~6.7 MB). Depends on `VCRUNTIME140.dll` (present on most Windows 10/11 systems). No other files needed.
+
+Port 20020 TCP inbound must be open on the agent PC:
+```powershell
+New-NetFirewallRule -DisplayName "VDesk Agent" -Direction Inbound -Protocol TCP -LocalPort 20020 -Action Allow
+```
+
 ## Architecture
+
+### State Machine (agent)
+
+`vdesk_agent/src/state.rs` defines `AgentState` shared between the polling loop (`main.rs`) and the TCP listener (`server.rs`) via `Arc<Mutex<AgentState>>`:
+
+```
+Idle ──[activate]──► Pending ──[handshake OK]──► Streaming ──[session end]──► Idle
+                              └─[handshake fail]──────────────────────────────► Idle
+```
+
+- Poll/heartbeat only runs when `Idle`
+- `listen_loop` only accepts connections when `Pending`
+- `listen_loop_direct` runs sessions inline (no spawn) so the accept loop blocks until the current session fully terminates — this prevents DXGI handle conflicts on reconnect
 
 ### Session Flow (backend mode)
 
 ```
 Agent → POST /api/host/register           → deviceKey
-Agent → POST /api/host/heartbeat          (15s loop, relayIp = agent's own LAN IP)
-Agent → POST /api/agent/sessions/poll     (3s loop, looks for REQUESTED status)
-Viewer → POST /api/remote/sessions        → sessionKey (creates REQUESTED session)
+Agent → POST /api/host/heartbeat          (15s loop)
+Agent → POST /api/agent/sessions/poll     (3s loop)
+Viewer → POST /api/remote/sessions        → sessionKey
 Agent poll → POST /api/agent/sessions/activate → RUNNING
 Viewer → GET /api/agent/sessions/relay    → relayIp:20020
 Viewer → TCP connect → handshake → stream
 ```
 
+### Video Pipeline (agent)
+
+```
+DXGI Desktop Duplication (BGRA, GPU→CPU)
+  → DirtyRects filter: only changed regions copied to CPU buffer
+  → bgra_to_i420 / bgra_to_i420_rects (BT.601, partial update)
+  → VP9 encode (libvpx, C wrapper vpx_wrap.c)
+  → try_send → session loop → FramedStream
+```
+
+VP9 bitrate: `VDESK_VP9_BITRATE_KBPS` env var (default 8000 kbps). Falls back to JPEG if VP9 init fails.
+
+**DirtyRects optimization**: `DxgiCapture::capture()` calls `GetFrameDirtyRects` after each `AcquireNextFrame`. If dirty area < 50% of screen, uses `CopySubresourceRegion` per rect instead of full `CopyResource`, and `bgra_to_i420_rects()` converts only those regions. The I420 buffer persists across frames.
+
 ### Wire Protocol
 
-**Agent → Viewer (server pushes):**
-- `0x10` Init: `[width(4BE), height(4BE), fps(1)]` — first message per session
-- `0x11` Frame: `[jpeg_len(4BE), jpeg_data]` — per frame
-- `0x12` Pong: `[timestamp(8BE)]` — RTT response
+**Agent → Viewer:**
+- `0x10` Init: `[width(4BE), height(4BE), fps(1), codec(1)]` — first message; codec `1`=VP9, `0`=JPEG
+- `0x11` Frame: `[is_key(1), data_len(4BE), vp9_or_jpeg_data]` — per frame
+- `0x12` Pong: `[timestamp(8BE)]`
 
-**Viewer → Agent (input events):**
+**Viewer → Agent:**
 - `0x01` MouseMove: `[x(4BE), y(4BE), win_w(2BE), win_h(2BE)]` — viewer window coords
 - `0x02` MouseButton: `[button(1), pressed(1)]` — Left=0, Right=2, Middle=4
 - `0x03` KeyPress: `[keycode(4BE), pressed(1)]` — winit 0.30 `KeyCode` discriminant
 - `0x04` Scroll: `[dx(2BE), dy(2BE)]` — Windows notch units (120 = one click)
-- `0x05` CharInput: `[len(2BE), utf8_bytes]` — IME-committed text (Korean/CJK)
 - `0x06` Ping: `[timestamp(8BE)]`
-- `0x07` MouseGlobal: `[gx(4BE), gy(4BE)]` — virtual screen absolute pixels (same-PC mode)
+- `0x07` MouseGlobal: `[gx(4BE), gy(4BE)]` — virtual screen absolute pixels
+- `0x08` KeyVk: `[vk(4BE), scan(2BE), pressed(1), extended(1)]` — Windows VK code path
 
-`0x07` is used when `VDESK_DIRECT=1` or `VDESK_MOUSE_GLOBAL=1`. The viewer computes `gx = window_inner_position.x + client_x` and the agent converts using `SM_XVIRTUALSCREEN`/`SM_CXVIRTUALSCREEN` to Windows absolute coords. This avoids coordinate-scaling errors when agent and viewer are on the same PC.
+`FramedStream` (from `hbb_common`) length-prefixes every message automatically; callers just call `send_bytes` / `next`.
+
+### Mouse Coordinate Paths
+
+- `0x01` used when viewer and agent are on **different PCs** — viewer sends client-area coords + window size; agent scales via `GetSystemMetrics`
+- `0x07` used when `VDESK_DIRECT=1` or `VDESK_MOUSE_GLOBAL=1` — viewer computes `gx = window_inner_position.x + client_x`; agent maps via `SM_XVIRTUALSCREEN`/`SM_CXVIRTUALSCREEN`
 
 ### Remote Control Mode (viewer)
 
 - **Off**: no input sent; title shows "클릭하여 원격 제어"
-- **On** (left-click): `CursorGrabMode::Confined` keeps cursor inside window; green 4px border; title changes; all mouse/keyboard forwarded as `0x01–0x07`
+- **On** (left-click to enter): `CursorGrabMode::Confined`; green 4px border; all mouse/keyboard forwarded
 - **Release**: Escape key or window close
-- `WDA_EXCLUDEFROMCAPTURE` applied on window creation — prevents the viewer window from appearing in the agent's screen capture (no infinite-mirror effect)
+- **F11**: fullscreen toggle (always local, never forwarded)
+- `WDA_EXCLUDEFROMCAPTURE` applied on window creation — prevents viewer window from appearing in agent's screen capture
 
-### Input Injection (agent)
+### Session Lifecycle & Reconnect
 
-`vdesk_agent/src/services/input.rs` wraps Windows `SendInput`. Non-Windows builds compile with no-op stubs. `set_no_inject(true)` disables all injection globally (used by `AGENT_NO_INJECT=1`).
+`session::run()` (agent) spawns a `spawn_blocking` capture task and keeps its `JoinHandle`. After the session loop exits:
+1. `video_rx` is dropped → capture loop detects `TrySendError::Closed` and exits
+2. `capture_handle.await` blocks until the task finishes — **DXGI `IDXGIOutputDuplication` handle is fully released before `run()` returns**
 
-Mouse coordinate paths:
-- `inject_mouse_move(vx, vy, win_w, win_h)` — scales viewer window coords to screen coords via `GetSystemMetrics`
-- `inject_mouse_move_global(gx, gy)` — maps virtual-screen absolute pixels to `MOUSEEVENTF_ABSOLUTE` using `SM_XVIRTUALSCREEN`/`SM_CXVIRTUALSCREEN` (handles multi-monitor)
+This prevents `DuplicateOutput` failure on quick reconnect. `video_tx` (original) is dropped immediately after spawning so that if the capture task fails before the first frame, `video_rx.recv()` returns `None` instead of blocking forever.
 
-### Agent Identity
-
-Generates a persistent `localBox` ID on first run, stored at `$TMPDIR/vdesk_agent_id`. Single active session enforced via `Arc<AtomicBool> session_active`; 1-hour background timeout resets it if the session isn't cleanly closed.
-
-### Key Files
+## Key Files
 
 | File | Purpose |
 |------|---------|
-| `vdesk_agent/src/server.rs` | TCP listener; `listen_loop` (backend mode) + `listen_loop_direct` (direct mode) |
-| `vdesk_agent/src/session.rs` | Per-session loop: JPEG frame send + input receive/dispatch |
-| `vdesk_agent/src/services/video.rs` | Screen capture (`screenshots`) + JPEG encode (`image`) |
-| `vdesk_agent/src/services/input.rs` | `SendInput` injection; coordinate conversion; no-op stubs |
-| `vdesk_agent/src/state.rs` | `AgentState` enum: `Idle / Pending / Streaming` |
+| `vdesk_agent/src/main.rs` | Registration + heartbeat + poll/activate loop; direct-mode entry |
+| `vdesk_agent/src/server.rs` | TCP listener; `listen_loop` (backend) + `listen_loop_direct` (direct) |
+| `vdesk_agent/src/session.rs` | Per-session: VP9 frame send + input receive/dispatch + capture lifecycle |
+| `vdesk_agent/src/state.rs` | `AgentState` enum + `SharedState = Arc<Mutex<AgentState>>` |
+| `vdesk_agent/src/services/capture_dxgi.rs` | DXGI Desktop Duplication; `DxgiCapture` + `CaptureFrame`; DirtyRects partial copy |
+| `vdesk_agent/src/services/video.rs` | Capture loop: DXGI → I420 → VP9 → channel; FNV hash frame skip |
+| `vdesk_agent/src/services/vpx_enc.rs` | VP9 encoder FFI wrapper (`vpx_wrap.c`) |
+| `vdesk_agent/src/services/yuv.rs` | `bgra_to_i420` (full) + `bgra_to_i420_rects` (partial, dirty-rect aware) |
+| `vdesk_agent/src/services/input.rs` | `SendInput` injection; coordinate conversion; no-op stubs on non-Windows |
 | `vdesk_viewer/src/display.rs` | winit 0.30 event loop; remote control mode; softbuffer render |
 | `vdesk_viewer/src/session.rs` | Frame receive/decode + input serialization |
 | `vdesk_viewer/src/connection.rs` | TCP connect + sessionKey handshake |
-| `vdesk_viewer/src/decoder.rs` | JPEG → XRGB pixel buffer |
+| `vdesk_viewer/src/vpx_dec.rs` | VP9 decoder FFI wrapper |
+| `vdesk_viewer/src/decoder.rs` | JPEG → XRGB pixel buffer (fallback path) |
 
 ## Key Conventions
 
 - Source comments and many identifiers are in Korean — this is expected.
-- `hbb_common` (from sibling `vdesk_client` workspace) provides `log`, `tcp::FramedStream`, and the Tokio re-export.
-- Codec is `screenshots` + JPEG (not VP9/scrap), avoiding the vcpkg+LLVM bindgen requirement.
-- `FramedStream` length-prefixes every message automatically; callers just call `send_bytes` / `next`.
+- `hbb_common` (from sibling `vdesk_client` workspace at `../vdesk_client/vdesk_client/libs/hbb_common`) provides `log`, `tcp::FramedStream`, and the Tokio re-export.
 - winit 0.30 requires `ApplicationHandler` trait; the event loop must run on the main thread. The session TCP loop runs in a spawned thread with its own `tokio::runtime::Runtime`.
-- `reqwest::blocking` must not be dropped inside a `block_on` context — the agent drops `rt` before calling blocking API cleanup.
+- `reqwest::blocking` must not be dropped inside a `block_on` context — the viewer drops `rt` before calling `end_session`.
+- VP9 C wrappers (`vpx_wrap.c`) are compiled via `cc` crate in `build.rs`; both agent and viewer have their own copy.

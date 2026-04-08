@@ -2,7 +2,7 @@
 //!
 //! screenshots(GDI) 대비 장점:
 //!   - GPU 메모리에서 직접 캡처 → CPU 사용률 대폭 감소
-//!   - 변경된 영역(DirtyRects) 정보 제공 (미래 최적화용)
+//!   - 변경된 영역(DirtyRects)만 부분 복사 → 추가 CPU/메모리 절약
 //!   - 레이턴시 < 1ms (vs GDI ~15ms)
 //!   - 출력: BGRA 포맷 (B=byte0, G=byte1, R=byte2, A=byte3)
 
@@ -15,7 +15,8 @@ use winapi::{
         dxgi1_2::*,
         dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM,
         dxgitype::*,
-        minwindef::{TRUE, UINT},
+        minwindef::UINT,
+        windef::RECT,
         winerror::{DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, S_OK},
     },
     um::{
@@ -24,6 +25,15 @@ use winapi::{
         unknwnbase::IUnknown,
     },
 };
+
+/// 변경된 영역을 나타내는 사각형
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DirtyRect {
+    pub left:   u32,
+    pub top:    u32,
+    pub right:  u32,
+    pub bottom: u32,
+}
 
 // ── COM 스마트 포인터 (scrap 방식) ──────────────────────────────────────────
 
@@ -44,16 +54,29 @@ impl<T> Drop for ComPtr<T> {
     }
 }
 
+// ── CaptureFrame ─────────────────────────────────────────────────────────────
+
+/// capture() 가 반환하는 프레임 정보
+pub struct CaptureFrame<'a> {
+    pub bgra:         &'a [u8],
+    pub is_full_frame: bool,
+    pub dirty_rects:  &'a [DirtyRect],
+}
+
 // ── DxgiCapture ─────────────────────────────────────────────────────────────
 
 pub struct DxgiCapture {
-    device:      ComPtr<ID3D11Device>,
-    context:     ComPtr<ID3D11DeviceContext>,
-    duplication: ComPtr<IDXGIOutputDuplication>,
-    staging:     ComPtr<ID3D11Texture2D>,
-    pub width:   u32,
-    pub height:  u32,
-    buf:         Vec<u8>, // BGRA 재사용 버퍼
+    device:           ComPtr<ID3D11Device>,
+    context:          ComPtr<ID3D11DeviceContext>,
+    duplication:      ComPtr<IDXGIOutputDuplication>,
+    staging:          ComPtr<ID3D11Texture2D>,
+    pub width:        u32,
+    pub height:       u32,
+    buf:              Vec<u8>,        // BGRA 재사용 버퍼 (이전 프레임 상태 유지)
+    dirty_rects_raw:  Vec<RECT>,      // winapi RECT 임시 버퍼
+    dirty_rects:      Vec<DirtyRect>, // 현재 프레임의 변경 영역
+    is_full_frame:    bool,
+    first_frame:      bool,
 }
 
 unsafe impl Send for DxgiCapture {}
@@ -154,7 +177,11 @@ impl DxgiCapture {
                 staging: ComPtr(staging),
                 width,
                 height,
-                buf: vec![0u8; buf_size],
+                buf:              vec![0u8; buf_size],
+                dirty_rects_raw:  Vec::new(),
+                dirty_rects:      Vec::new(),
+                is_full_frame:    true,
+                first_frame:      true,
             })
         }
     }
@@ -182,11 +209,11 @@ impl DxgiCapture {
         Ok(tex)
     }
 
-    /// 다음 프레임 캡처 (BGRA 슬라이스 반환)
-    /// - Ok(Some(bgra)) : 새 프레임
-    /// - Ok(None)       : 변화 없음 (timeout)
-    /// - Err            : 재연결 필요
-    pub fn capture(&mut self) -> Result<Option<&[u8]>> {
+    /// 다음 프레임 캡처
+    /// - Ok(Some(frame)) : 새 프레임. frame.bgra, frame.is_full_frame, frame.dirty_rects 제공
+    /// - Ok(None)        : 변화 없음 (timeout 또는 LastPresentTime==0)
+    /// - Err             : 재연결 필요
+    pub fn capture(&mut self) -> Result<Option<CaptureFrame<'_>>> {
         unsafe {
             let mut frame_resource: *mut IDXGIResource = ptr::null_mut();
             let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = mem::zeroed();
@@ -215,6 +242,26 @@ impl DxgiCapture {
                 return Ok(None);
             }
 
+            // ── DirtyRects 조회 ──────────────────────────────────────────────
+            let mut required: UINT = 0;
+            (*self.duplication.0).GetFrameDirtyRects(0, ptr::null_mut(), &mut required);
+            let num_rects = required as usize / mem::size_of::<RECT>();
+            self.dirty_rects_raw.resize(num_rects, mem::zeroed());
+            if num_rects > 0 {
+                (*self.duplication.0).GetFrameDirtyRects(
+                    required,
+                    self.dirty_rects_raw.as_mut_ptr(),
+                    &mut required,
+                );
+            }
+
+            // 전체 화면 면적의 50% 이상 변경 시 → 전체 복사 (부분 복사 오버헤드 방지)
+            let screen_area = (self.width * self.height) as i64;
+            let dirty_area: i64 = self.dirty_rects_raw.iter().map(|r| {
+                (r.right - r.left).max(0) as i64 * (r.bottom - r.top).max(0) as i64
+            }).sum();
+            let use_full_copy = self.first_frame || num_rects == 0 || dirty_area * 2 >= screen_area;
+
             // IDXGIResource → ID3D11Texture2D
             let mut desktop_tex: *mut ID3D11Texture2D = ptr::null_mut();
             let hr = (*frame_resource.0).QueryInterface(
@@ -227,11 +274,33 @@ impl DxgiCapture {
             }
             let desktop_tex = ComPtr(desktop_tex);
 
-            // GPU 텍스처 → 스테이징 텍스처 복사 (CPU 읽기 가능)
-            (*self.context.0).CopyResource(
-                self.staging.0 as *mut ID3D11Resource,
-                desktop_tex.0 as *mut ID3D11Resource,
-            );
+            if use_full_copy {
+                // ── 전체 복사 ────────────────────────────────────────────────
+                (*self.context.0).CopyResource(
+                    self.staging.0 as *mut ID3D11Resource,
+                    desktop_tex.0 as *mut ID3D11Resource,
+                );
+            } else {
+                // ── 부분 복사: 변경된 영역만 ────────────────────────────────
+                for rect in &self.dirty_rects_raw {
+                    let box_ = D3D11_BOX {
+                        left:  rect.left  as UINT,
+                        top:   rect.top   as UINT,
+                        front: 0,
+                        right: rect.right as UINT,
+                        bottom: rect.bottom as UINT,
+                        back:  1,
+                    };
+                    (*self.context.0).CopySubresourceRegion(
+                        self.staging.0 as *mut ID3D11Resource,
+                        0,
+                        rect.left as UINT, rect.top as UINT, 0,
+                        desktop_tex.0 as *mut ID3D11Resource,
+                        0,
+                        &box_,
+                    );
+                }
+            }
 
             // 스테이징 텍스처 Map
             let mut mapped: D3D11_MAPPED_SUBRESOURCE = mem::zeroed();
@@ -248,28 +317,62 @@ impl DxgiCapture {
                 return Err(anyhow!("Map staging: 0x{:08X}", hr));
             }
 
-            // BGRA 데이터 복사 (stride 주의: 텍스처 행 간격 ≥ width*4)
             let row_pitch = mapped.RowPitch as usize;
             let w = self.width as usize;
             let h = self.height as usize;
+            let src_base = mapped.pData as *const u8;
 
-            if row_pitch == w * 4 {
-                // 패딩 없음: 한 번에 복사
-                let src = slice::from_raw_parts(mapped.pData as *const u8, w * h * 4);
-                self.buf.copy_from_slice(src);
-            } else {
-                // 행마다 복사 (stride 처리)
-                let src = mapped.pData as *const u8;
-                for row in 0..h {
-                    let src_row = slice::from_raw_parts(src.add(row * row_pitch), w * 4);
-                    let dst_row = &mut self.buf[row * w * 4..(row + 1) * w * 4];
-                    dst_row.copy_from_slice(src_row);
+            if use_full_copy {
+                // ── 전체 버퍼 복사 (stride 처리) ────────────────────────────
+                if row_pitch == w * 4 {
+                    let src = slice::from_raw_parts(src_base, w * h * 4);
+                    self.buf.copy_from_slice(src);
+                } else {
+                    for row in 0..h {
+                        let src_row = slice::from_raw_parts(src_base.add(row * row_pitch), w * 4);
+                        let dst_row = &mut self.buf[row * w * 4..(row + 1) * w * 4];
+                        dst_row.copy_from_slice(src_row);
+                    }
                 }
+                // dirty_rects 를 전체 화면 1개 rect 로 표시
+                self.dirty_rects.clear();
+                self.dirty_rects.push(DirtyRect { left: 0, top: 0, right: self.width, bottom: self.height });
+                self.is_full_frame = true;
+            } else {
+                // ── 변경 영역만 버퍼 업데이트 ────────────────────────────────
+                self.dirty_rects.clear();
+                for rect in &self.dirty_rects_raw {
+                    let x0 = rect.left  as usize;
+                    let x1 = (rect.right as usize).min(w);
+                    let y0 = rect.top    as usize;
+                    let y1 = (rect.bottom as usize).min(h);
+                    let col_bytes = (x1 - x0) * 4;
+
+                    for row in y0..y1 {
+                        let src_off = row * row_pitch + x0 * 4;
+                        let dst_off = row * w * 4 + x0 * 4;
+                        let src_slice = slice::from_raw_parts(src_base.add(src_off), col_bytes);
+                        self.buf[dst_off..dst_off + col_bytes].copy_from_slice(src_slice);
+                    }
+
+                    self.dirty_rects.push(DirtyRect {
+                        left:   rect.left  as u32,
+                        top:    rect.top   as u32,
+                        right:  rect.right as u32,
+                        bottom: rect.bottom as u32,
+                    });
+                }
+                self.is_full_frame = false;
             }
 
             (*self.context.0).Unmap(self.staging.0 as *mut ID3D11Resource, 0);
+            self.first_frame = false;
 
-            Ok(Some(&self.buf))
+            Ok(Some(CaptureFrame {
+                bgra:          &self.buf,
+                is_full_frame: self.is_full_frame,
+                dirty_rects:   &self.dirty_rects,
+            }))
         }
     }
 }

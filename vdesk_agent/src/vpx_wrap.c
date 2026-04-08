@@ -8,6 +8,29 @@ typedef unsigned char  u8;
 typedef unsigned int   u32;
 typedef long long      i64;
 
+/* 마지막 오류 메시지 (초기화 실패 시 진단용) */
+static char g_last_err[512];
+
+static void set_last_err(const vpx_codec_ctx_t *ctx, const char *stage) {
+    const char *e  = ctx ? vpx_codec_error(ctx) : NULL;
+    const char *ed = ctx ? vpx_codec_error_detail(ctx) : NULL;
+    if (!e)  e  = "unknown";
+    if (!ed) ed = "";
+    if (!stage) stage = "vpx";
+    g_last_err[0] = 0;
+    strncat(g_last_err, stage, sizeof(g_last_err) - 1);
+    strncat(g_last_err, ": ", sizeof(g_last_err) - strlen(g_last_err) - 1);
+    strncat(g_last_err, e, sizeof(g_last_err) - strlen(g_last_err) - 1);
+    if (ed[0]) {
+        strncat(g_last_err, " | ", sizeof(g_last_err) - strlen(g_last_err) - 1);
+        strncat(g_last_err, ed, sizeof(g_last_err) - strlen(g_last_err) - 1);
+    }
+}
+
+const char* vpx_enc_last_error(void) {
+    return g_last_err;
+}
+
 typedef struct {
     vpx_codec_ctx_t     ctx;
     vpx_codec_enc_cfg_t cfg;
@@ -19,12 +42,14 @@ typedef struct {
 /* 에러 코드 (out_err로 반환): 0=성공, 1=calloc실패, 2=config_default실패, 3=enc_init실패, 4=img_alloc실패 */
 VpxEncHandle* vpx_enc_create_ex(int w, int h, int bitrate_kbps, int fps, int *out_err) {
     if (out_err) *out_err = 0;
+    g_last_err[0] = 0;
 
     VpxEncHandle *handle = (VpxEncHandle*)calloc(1, sizeof(VpxEncHandle));
-    if (!handle) { if (out_err) *out_err = 1; return NULL; }
+    if (!handle) { if (out_err) *out_err = 1; strncpy(g_last_err, "calloc failed", sizeof(g_last_err)-1); return NULL; }
 
     const vpx_codec_iface_t *iface = vpx_codec_vp9_cx();
     if (vpx_codec_enc_config_default(iface, &handle->cfg, 0) != VPX_CODEC_OK) {
+        set_last_err(&handle->ctx, "vpx_codec_enc_config_default");
         free(handle);
         if (out_err) *out_err = 2;
         return NULL;
@@ -47,10 +72,12 @@ VpxEncHandle* vpx_enc_create_ex(int w, int h, int bitrate_kbps, int fps, int *ou
     handle->cfg.g_timebase.num     = 1;
     handle->cfg.g_timebase.den     = fps;
     handle->cfg.kf_mode            = VPX_KF_AUTO;
-    handle->cfg.kf_min_dist        = (unsigned)fps;
+    /* VPX_KF_AUTO에서는 kf_min_dist가 지원되지 않음(0만 허용). */
+    handle->cfg.kf_min_dist        = 0;
     handle->cfg.kf_max_dist        = (unsigned)(fps * 3);
 
     if (vpx_codec_enc_init(&handle->ctx, iface, &handle->cfg, 0) != VPX_CODEC_OK) {
+        set_last_err(&handle->ctx, "vpx_codec_enc_init");
         free(handle);
         if (out_err) *out_err = 3;
         return NULL;
@@ -62,6 +89,7 @@ VpxEncHandle* vpx_enc_create_ex(int w, int h, int bitrate_kbps, int fps, int *ou
     vpx_codec_control(&handle->ctx, VP9E_SET_AQ_MODE, 3);
 
     if (!vpx_img_alloc(&handle->img, VPX_IMG_FMT_I420, (unsigned)w, (unsigned)h, 1)) {
+        set_last_err(&handle->ctx, "vpx_img_alloc");
         vpx_codec_destroy(&handle->ctx);
         free(handle);
         if (out_err) *out_err = 4;

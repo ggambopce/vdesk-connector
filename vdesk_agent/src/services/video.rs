@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use super::{
     capture_dxgi::DxgiCapture,
     vpx_enc::VpxEncoder,
-    yuv::bgra_to_i420,
+    yuv::{bgra_to_i420, bgra_to_i420_rects},
 };
 
 pub const TARGET_FPS: u64 = 60;
@@ -27,7 +27,7 @@ const FRAME_INTERVAL: Duration = Duration::from_micros(1_000_000 / TARGET_FPS);
 const JPEG_QUALITY: u8 = 80;
 
 // VP9 비트레이트 (kbps): 1080p 원격 데스크톱 권장값
-const BITRATE_KBPS: u32 = 3000;
+const BITRATE_KBPS_DEFAULT: u32 = 8000;
 
 // ── VideoFrame ───────────────────────────────────────────────────────────────
 
@@ -106,10 +106,20 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
     let h = capture.height;
     log::info!("[video] {}x{} DXGI 캡처 초기화 완료", w, h);
 
+    let bitrate_kbps = std::env::var("VDESK_VP9_BITRATE_KBPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(BITRATE_KBPS_DEFAULT);
+
     // VP9 인코더 초기화 (실패 시 JPEG 폴백)
-    let mut encoder: Option<VpxEncoder> = match VpxEncoder::new(w, h, BITRATE_KBPS, TARGET_FPS as u32) {
+    let mut encoder: Option<VpxEncoder> =
+        match VpxEncoder::new(w, h, bitrate_kbps, TARGET_FPS as u32) {
         Ok(enc) => {
-            log::info!("[video] VP9 인코더 초기화 완료 ({}kbps, {}fps)", BITRATE_KBPS, TARGET_FPS);
+            log::info!(
+                "[video] VP9 인코더 초기화 완료 ({}kbps, {}fps)",
+                bitrate_kbps,
+                TARGET_FPS
+            );
             Some(enc)
         }
         Err(e) => {
@@ -138,8 +148,8 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
         last_tick = Instant::now();
 
         // DXGI 캡처
-        let bgra = match capture.capture() {
-            Ok(Some(b)) => b,
+        let frame = match capture.capture() {
+            Ok(Some(f)) => f,
             Ok(None)    => continue, // 변화 없음
             Err(e) => {
                 log::warn!("[video] DXGI 캡처 오류: {:?} — 재초기화 시도", e);
@@ -159,20 +169,25 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
             }
         };
 
-        // 변화 감지 (FNV 샘플 해시)
-        let hash = fnv_sample(bgra);
-        let is_static = hash == last_hash;
-        last_hash = hash;
-
+        // 변화 감지 (FNV 샘플 해시) — 전체 프레임이 아닐 때만 (부분 캡처 시 전체 해시는 의미 없음)
         let force_key = frames % (TARGET_FPS * 3) == 0;
-        if is_static && !force_key {
-            continue;
+        if frame.is_full_frame {
+            let hash = fnv_sample(frame.bgra);
+            let is_static = hash == last_hash;
+            last_hash = hash;
+            if is_static && !force_key {
+                continue;
+            }
         }
 
         // ── 인코딩 ──────────────────────────────────────────────────────────
         let (encoded, codec, is_key) = if let Some(enc) = encoder.as_mut() {
-            // VP9 경로
-            bgra_to_i420(bgra, w as usize, h as usize, &mut i420_buf);
+            // VP9 경로 — 변경 영역만 I420 업데이트 (전체 변경 시 전체 변환)
+            if frame.is_full_frame {
+                bgra_to_i420(frame.bgra, w as usize, h as usize, &mut i420_buf);
+            } else {
+                bgra_to_i420_rects(frame.bgra, w as usize, h as usize, &mut i420_buf, frame.dirty_rects);
+            }
             match enc.encode(&i420_buf, force_key) {
                 Ok(Some((d, k))) => (d.to_vec(), Codec::Vp9, k),
                 Ok(None)         => continue,
@@ -183,7 +198,7 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
             }
         } else {
             // JPEG 폴백 경로
-            match encode_jpeg(bgra, w, h) {
+            match encode_jpeg(frame.bgra, w, h) {
                 Ok(d) => (d, Codec::Jpeg, true),
                 Err(e) => {
                     log::warn!("[video] JPEG 인코딩 오류: {:?}", e);
