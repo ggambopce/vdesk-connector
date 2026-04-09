@@ -5,6 +5,7 @@
 //!               codec: 1=VP9
 //!   0x11 Frame: [is_key(1), data_len(4BE), vp9_data]
 //!   0x12 Pong:  [timestamp(8BE)]
+//!   0x13 CursorShape: [cursor_type(1)]  — 0=Arrow 1=IBeam 2=SizeWE … 9=No
 //!
 //! ── 송신 (뷰어 → 에이전트) ───────────────────────────────────────────────────
 //!   0x01 MouseMove   0x02 MouseButton  0x03 KeyPress
@@ -25,9 +26,10 @@ use crate::{
 };
 
 // ── 타입 상수 ────────────────────────────────────────────────────────────────
-const MSG_INIT:  u8 = 0x10;
-const MSG_FRAME: u8 = 0x11;
-const MSG_PONG:  u8 = 0x12;
+const MSG_INIT:   u8 = 0x10;
+const MSG_FRAME:  u8 = 0x11;
+const MSG_PONG:   u8 = 0x12;
+const MSG_CURSOR: u8 = 0x13;
 
 const IN_MOUSE_MOVE:   u8 = 0x01;
 const IN_MOUSE_BUTTON: u8 = 0x02;
@@ -171,6 +173,12 @@ fn handle_agent_msg(
             let rtt  = now_ms().saturating_sub(sent);
             log::debug!("[session] RTT: {}ms", rtt);
         }
+
+        MSG_CURSOR if bytes.len() >= 2 => {
+            let ty = bytes[1];
+            crate::display::REMOTE_CURSOR_TYPE.store(ty, std::sync::atomic::Ordering::Relaxed);
+        }
+
         _ => {}
     }
 }

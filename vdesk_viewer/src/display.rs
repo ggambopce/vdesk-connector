@@ -17,7 +17,11 @@
 
 use anyhow::Result;
 use softbuffer::Surface;
-use std::{num::NonZeroU32, sync::Arc};
+use std::{num::NonZeroU32, sync::{atomic::AtomicU8, Arc}};
+
+/// 에이전트에서 수신한 원격 커서 타입 (session.rs에서 갱신)
+/// 0=Arrow 1=IBeam 2=SizeWE 3=SizeNS 4=SizeNWSE 5=SizeNESW 6=SizeAll 7=Hand 8=Wait 9=No
+pub static REMOTE_CURSOR_TYPE: AtomicU8 = AtomicU8::new(0);
 use winit::{
     application::ApplicationHandler,
     event::{
@@ -134,8 +138,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             WindowEvent::Resized(size) => {
                 self.window_size = (size.width.max(1), size.height.max(1));
                 self.surface_size = (0, 0);
-                // 리사이즈 완료 후 제어 모드 grab 복구 (at_edge 재평가는 CursorMoved에서 처리)
-                if self.control_active && self.at_edge {
+                // 리사이즈 완료 후 grab 복구 — trigger_edge_resize가 ClipCursor(NULL)로
+                // grab을 해제했으므로 새 창 크기 기준으로 재적용
+                if self.control_active {
                     self.at_edge = false;
                     if let Some(w) = self.window.clone() {
                         let _ = w.set_cursor_grab(CursorGrabMode::Confined);
@@ -155,25 +160,14 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 let (win_w, win_h) = self.window_size;
 
                 if self.control_active {
-                    let now_at_edge = ht_code_for_pos(x, y, win_w, win_h).is_some();
-                    if now_at_edge != self.at_edge {
-                        self.at_edge = now_at_edge;
-                        if let Some(w) = self.window.clone() {
-                            if now_at_edge {
-                                // 가장자리: grab 해제 → OS가 리사이즈 핸들 인식 가능
-                                let _ = w.set_cursor_grab(CursorGrabMode::None);
-                            } else {
-                                // 내부 복귀: grab 재적용
-                                let _ = w.set_cursor_grab(CursorGrabMode::Confined);
-                            }
-                        }
-                    }
+                    // at_edge: 에이전트 입력 필터 + 가장자리 리사이즈 트리거용 (grab은 항상 유지)
+                    self.at_edge = ht_code_for_pos(x, y, win_w, win_h).is_some();
                     // 가장자리에서는 에이전트에 마우스 이동 미전달
                     if !self.at_edge {
                         self.send_pointer_move(x, y);
                     }
-                    // 커서 아이콘: grab 변경 이후에 Win32 직접 호출 (winit 우회)
-                    apply_cursor_win32(x, y, win_w, win_h);
+                    // 원격 커서 모양 미러링
+                    apply_cursor_win32();
                 }
             }
 
@@ -369,21 +363,13 @@ impl ViewerApp {
         // 진입 시 에이전트 입력 상태 초기화 — 이전 세션에서 고착된 키/버튼이 있어도 해제
         self.release_all_inputs();
 
-        // 커서를 창 안에 가둠 (가장자리면 리사이즈 허용을 위해 grab 보류)
-        let (win_w, win_h) = self.window_size;
-        self.at_edge = self.last_cursor
-            .map(|(x, y)| ht_code_for_pos(x, y, win_w, win_h).is_some())
-            .unwrap_or(false);
-        if !self.at_edge {
-            if let Err(e) = window.set_cursor_grab(CursorGrabMode::Confined) {
-                hbb_common::log::warn!("[display] CursorGrab::Confined 실패: {:?}", e);
-            }
+        // 커서를 창 안에 가둠 (항상 적용)
+        self.at_edge = false;
+        if let Err(e) = window.set_cursor_grab(CursorGrabMode::Confined) {
+            hbb_common::log::warn!("[display] CursorGrab::Confined 실패: {:?}", e);
         }
         window.set_cursor_visible(true);
-        if let Some((x, y)) = self.last_cursor {
-            let (win_w, win_h) = self.window_size;
-            apply_cursor_win32(x, y, win_w, win_h);
-        }
+        apply_cursor_win32();
         window.set_title("VDesk Viewer [원격 제어 중] — ESC로 해제");
         self.control_active = true;
 
@@ -676,34 +662,37 @@ fn draw_control_border(buf: &mut softbuffer::Buffer<'_, Arc<Window>, Arc<Window>
     }
 }
 
-/// Win32 SetCursor를 직접 호출해 커서 아이콘 적용
+/// 커서 타입 코드(0~9) → Windows IDC 커서 상수
+/// 0=Arrow 1=IBeam 2=SizeWE 3=SizeNS 4=SizeNWSE 5=SizeNESW 6=SizeAll 7=Hand 8=Wait 9=No
+fn cursor_type_to_idc(ty: u8) -> usize {
+    match ty {
+        1 => 32513, // IDC_IBEAM
+        2 => 32644, // IDC_SIZEWE
+        3 => 32645, // IDC_SIZENS
+        4 => 32642, // IDC_SIZENWSE
+        5 => 32643, // IDC_SIZENESW
+        6 => 32646, // IDC_SIZEALL
+        7 => 32649, // IDC_HAND
+        8 => 32514, // IDC_WAIT
+        9 => 32648, // IDC_NO
+        _ => 32512, // IDC_ARROW
+    }
+}
+
+/// Win32 SetCursor를 직접 호출해 원격 커서 모양 미러링
 /// winit의 set_cursor는 set_cursor_grab 이후 WM_SETCURSOR에 의해 재설정될 수 있으므로
 /// 직접 Win32 API를 통해 확실하게 적용한다.
 #[cfg(target_os = "windows")]
-fn apply_cursor_win32(x: i32, y: i32, win_w: u32, win_h: u32) {
+fn apply_cursor_win32() {
     extern "system" {
         fn SetCursor(cursor: isize) -> isize;
         fn LoadCursorW(instance: isize, cursor_name: usize) -> isize;
     }
-    // Standard system cursor IDs
-    const IDC_ARROW:    usize = 32512;
-    const IDC_SIZEWE:   usize = 32644; // ← →
-    const IDC_SIZENS:   usize = 32645; // ↑ ↓
-    const IDC_SIZENWSE: usize = 32642; // ↖ ↘
-    const IDC_SIZENESW: usize = 32643; // ↗ ↙
-
-    let icon = cursor_for_pos(x, y, win_w, win_h, false);
-    let id = match icon {
-        CursorIcon::EResize | CursorIcon::WResize   => IDC_SIZEWE,
-        CursorIcon::NResize | CursorIcon::SResize   => IDC_SIZENS,
-        CursorIcon::NwResize | CursorIcon::SeResize => IDC_SIZENWSE,
-        CursorIcon::NeResize | CursorIcon::SwResize => IDC_SIZENESW,
-        _                                           => IDC_ARROW,
-    };
-    unsafe { SetCursor(LoadCursorW(0, id)); }
+    let ty = REMOTE_CURSOR_TYPE.load(std::sync::atomic::Ordering::Relaxed);
+    unsafe { SetCursor(LoadCursorW(0, cursor_type_to_idc(ty))); }
 }
 #[cfg(not(target_os = "windows"))]
-fn apply_cursor_win32(_x: i32, _y: i32, _w: u32, _h: u32) {}
+fn apply_cursor_win32() {}
 
 /// 커서 위치 → Windows HT(hit-test) 코드 반환 (가장자리면 Some, 내부면 None)
 fn ht_code_for_pos(x: i32, y: i32, win_w: u32, win_h: u32) -> Option<usize> {
@@ -732,6 +721,7 @@ fn trigger_edge_resize(window: &Arc<Window>, ht: usize, screen_x: i32, screen_y:
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     extern "system" {
         fn ReleaseCapture() -> i32;
+        fn ClipCursor(rect: *const u8) -> i32;
         fn PostMessageA(hwnd: isize, msg: u32, w: usize, l: isize) -> isize;
     }
     const WM_NCLBUTTONDOWN: u32 = 0x00A1;
@@ -741,35 +731,13 @@ fn trigger_edge_resize(window: &Arc<Window>, ht: usize, screen_x: i32, screen_y:
     let lparam = (((screen_y as i32 as isize) << 16) | (screen_x as u16 as isize)) as isize;
     unsafe {
         ReleaseCapture();
+        ClipCursor(std::ptr::null()); // grab 해제 → OS 리사이즈 루프가 자유롭게 커서 이동
         PostMessageA(hwnd, WM_NCLBUTTONDOWN, ht, lparam);
     }
 }
 #[cfg(not(target_os = "windows"))]
 fn trigger_edge_resize(_window: &Arc<Window>, _ht: usize, _sx: i32, _sy: i32) {}
 
-/// 마우스 위치에 따라 커서 아이콘 결정
-/// - 창 가장자리(12px 이내): 방향별 리사이즈 커서
-/// - 중앙 + 제어 모드: Crosshair
-/// - 중앙 + 비제어 모드: Default
-fn cursor_for_pos(x: i32, y: i32, win_w: u32, win_h: u32, _control_active: bool) -> CursorIcon {
-    const EDGE: i32 = 12;
-    let at_left   = x < EDGE;
-    let at_right  = x >= win_w as i32 - EDGE;
-    let at_top    = y < EDGE;
-    let at_bottom = y >= win_h as i32 - EDGE;
-
-    match (at_top, at_bottom, at_left, at_right) {
-        (true,  _,     true,  _    ) => CursorIcon::NwResize,
-        (true,  _,     _,     true ) => CursorIcon::NeResize,
-        (_,     true,  true,  _    ) => CursorIcon::SwResize,
-        (_,     true,  _,     true ) => CursorIcon::SeResize,
-        (true,  _,     _,     _    ) => CursorIcon::NResize,
-        (_,     true,  _,     _    ) => CursorIcon::SResize,
-        (_,     _,     true,  _    ) => CursorIcon::WResize,
-        (_,     _,     _,     true ) => CursorIcon::EResize,
-        _                            => CursorIcon::Default,
-    }
-}
 
 /// Windows: 현재 메시지가 에이전트 SendInput 주입인지 확인
 /// 에이전트는 dwExtraInfo=0x5DEC_0001 로 마킹한다.

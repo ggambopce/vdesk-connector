@@ -19,9 +19,10 @@ use tokio::sync::mpsc;
 use crate::services::video::{self, VideoFrame};
 
 // ── 에이전트 → 뷰어 타입 ─────────────────────────────────────────────────────
-const MSG_INIT:  u8 = 0x10;
-const MSG_FRAME: u8 = 0x11;
-const MSG_PONG:  u8 = 0x12;
+const MSG_INIT:   u8 = 0x10;
+const MSG_FRAME:  u8 = 0x11;
+const MSG_PONG:   u8 = 0x12;
+const MSG_CURSOR: u8 = 0x13; // [cursor_type(1)]
 
 // ── 뷰어 → 에이전트 타입 ─────────────────────────────────────────────────────
 const IN_MOUSE_MOVE:   u8 = 0x01;
@@ -37,8 +38,13 @@ pub async fn run(mut stream: FramedStream, session_key: String) -> Result<()> {
 
     // 비디오 캡처 채널
     let (video_tx, mut video_rx) = mpsc::channel::<VideoFrame>(2);
-    // 아웃바운드 제어 메시지 (Pong)
+    // 아웃바운드 제어 메시지 (Pong, CursorShape)
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(16);
+
+    // 커서 폴링: 50ms 간격으로 원격 커서 모양 감지 후 전송
+    let mut cursor_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    cursor_tick.tick().await;
+    let mut last_cursor_type: u8 = 0xFF; // 첫 전송 강제
 
     // 화면 캡처 태스크 — JoinHandle 보관하여 종료 대기에 사용
     let capture_handle = tokio::task::spawn_blocking({
@@ -88,6 +94,17 @@ pub async fn run(mut stream: FramedStream, session_key: String) -> Result<()> {
                     break;
                 }
             }
+            _ = cursor_tick.tick() => {
+                let ct = get_cursor_type();
+                if ct != last_cursor_type {
+                    last_cursor_type = ct;
+                    let msg = Bytes::from(vec![MSG_CURSOR, ct]);
+                    if let Err(e) = stream.send_bytes(msg).await {
+                        log::warn!("[session] 커서 전송 오류: {:?}", e);
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -100,6 +117,53 @@ pub async fn run(mut stream: FramedStream, session_key: String) -> Result<()> {
     log::info!("[session] 세션 종료: {}", session_key);
     Ok(())
 }
+
+// ── 커서 타입 (에이전트 → 뷰어 공통 정의) ────────────────────────────────────
+// 0=Arrow 1=IBeam 2=SizeWE 3=SizeNS 4=SizeNWSE 5=SizeNESW 6=SizeAll 7=Hand 8=Wait 9=No
+
+/// 현재 시스템 커서를 감지해 커서 타입(0~9)으로 반환
+#[cfg(target_os = "windows")]
+fn get_cursor_type() -> u8 {
+    #[repr(C)]
+    struct CURSORINFO { cb: u32, flags: u32, hcursor: isize, pt_x: i32, pt_y: i32 }
+    extern "system" {
+        fn GetCursorInfo(pci: *mut CURSORINFO) -> i32;
+        fn LoadCursorW(instance: isize, name: usize) -> isize;
+    }
+    let mut ci = CURSORINFO { cb: std::mem::size_of::<CURSORINFO>() as u32,
+                              flags: 0, hcursor: 0, pt_x: 0, pt_y: 0 };
+    if unsafe { GetCursorInfo(&mut ci) } == 0 { return 0; }
+    let h = ci.hcursor;
+    // 시스템 커서 ID
+    const IDC_ARROW:    usize = 32512;
+    const IDC_IBEAM:    usize = 32513;
+    const IDC_WAIT:     usize = 32514;
+    const IDC_SIZENWSE: usize = 32642;
+    const IDC_SIZENESW: usize = 32643;
+    const IDC_SIZEWE:   usize = 32644;
+    const IDC_SIZENS:   usize = 32645;
+    const IDC_SIZEALL:  usize = 32646;
+    const IDC_NO:       usize = 32648;
+    const IDC_HAND:     usize = 32649;
+    let ids: &[(usize, u8)] = &[
+        (IDC_IBEAM,    1),
+        (IDC_SIZEWE,   2),
+        (IDC_SIZENS,   3),
+        (IDC_SIZENWSE, 4),
+        (IDC_SIZENESW, 5),
+        (IDC_SIZEALL,  6),
+        (IDC_HAND,     7),
+        (IDC_WAIT,     8),
+        (IDC_NO,       9),
+        (IDC_ARROW,    0),
+    ];
+    for &(id, ty) in ids {
+        if unsafe { LoadCursorW(0, id) } == h { return ty; }
+    }
+    0 // 알 수 없으면 Arrow
+}
+#[cfg(not(target_os = "windows"))]
+fn get_cursor_type() -> u8 { 0 }
 
 // ── 메시지 빌더 ──────────────────────────────────────────────────────────────
 
