@@ -82,6 +82,10 @@ struct ViewerApp {
     /// 프레임 내 뷰포트 좌상단 위치 (픽셀). 창이 프레임보다 작을 때 패닝에 사용.
     scroll_x: u32,
     scroll_y: u32,
+
+    /// 현재 눌린 마우스 버튼 상태 (비트마스크: bit0=Left, bit1=Right, bit2=Middle)
+    /// release_all_inputs 시 실제로 눌린 버튼만 해제 전송 (오발 방지)
+    mouse_btns: u8,
 }
 
 impl ApplicationHandler<ViewerEvent> for ViewerApp {
@@ -138,11 +142,12 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 let x = position.x as i32;
                 let y = position.y as i32;
                 self.last_cursor = Some((x, y));
+                // Windows WM_SETCURSOR가 커서 아이콘을 리셋하므로 매번 재적용
+                if let Some(w) = &self.window {
+                    let (win_w, win_h) = self.window_size;
+                    w.set_cursor(cursor_for_pos(x, y, win_w, win_h, self.control_active));
+                }
                 if self.control_active {
-                    // Windows WM_SETCURSOR가 커서 아이콘을 리셋하므로 매번 재적용
-                    if let Some(w) = &self.window {
-                        w.set_cursor(CursorIcon::Crosshair);
-                    }
                     self.send_pointer_move(x, y);
                 }
             }
@@ -163,16 +168,15 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 // 활성 상태에서만 에이전트로 전달
                 if self.control_active {
                     if let Some(tx) = &self.input_tx {
-                        let btn = match button {
-                            MouseButton::Left   => 0u32,
-                            MouseButton::Right  => 2u32,
-                            MouseButton::Middle => 4u32,
+                        let (btn, bit) = match button {
+                            MouseButton::Left   => (0u32, 0b001u8),
+                            MouseButton::Right  => (2u32, 0b010u8),
+                            MouseButton::Middle => (4u32, 0b100u8),
                             _ => return,
                         };
-                        let _ = tx.send(InputEvent::MouseButton {
-                            button:  btn,
-                            pressed: state == ElementState::Pressed,
-                        });
+                        let pressed = state == ElementState::Pressed;
+                        if pressed { self.mouse_btns |= bit; } else { self.mouse_btns &= !bit; }
+                        let _ = tx.send(InputEvent::MouseButton { button: btn, pressed });
                     }
                 }
             }
@@ -320,7 +324,8 @@ impl ViewerApp {
 
     /// 원격 제어 모드 활성화
     fn activate_control_mode(&mut self) {
-        let Some(window) = &self.window else { return };
+        // Arc 클론으로 window 참조를 분리해 release_all_inputs(&mut self) 호출 허용
+        let Some(window) = self.window.clone() else { return };
 
         // 진입 시 에이전트 입력 상태 초기화 — 이전 세션에서 고착된 키/버튼이 있어도 해제
         self.release_all_inputs();
@@ -330,7 +335,13 @@ impl ViewerApp {
             hbb_common::log::warn!("[display] CursorGrab::Confined 실패: {:?}", e);
         }
         window.set_cursor_visible(true);
-        window.set_cursor(CursorIcon::Crosshair);
+        {
+            let (win_w, win_h) = self.window_size;
+            let icon = self.last_cursor
+                .map(|(x, y)| cursor_for_pos(x, y, win_w, win_h, true))
+                .unwrap_or(CursorIcon::Crosshair);
+            window.set_cursor(icon);
+        }
         window.set_title("VDesk Viewer [원격 제어 중] — ESC로 해제");
         self.control_active = true;
 
@@ -346,7 +357,7 @@ impl ViewerApp {
 
     /// 원격 제어 모드 비활성화
     fn deactivate_control_mode(&mut self) {
-        let Some(window) = &self.window else { return };
+        let Some(window) = self.window.clone() else { return };
 
         // 훅 제거 전 모든 입력 강제 해제
         // — 수정 키·마우스 버튼을 누른 채 ESC 를 누르면 훅이 사라져 keyup/mouseup 이
@@ -366,7 +377,7 @@ impl ViewerApp {
     /// 에이전트에 모든 수정 키·마우스 버튼 해제 이벤트 전송
     ///
     /// 제어 모드 진입/해제 양쪽에서 호출해 에이전트 입력 상태를 항상 클린하게 유지한다.
-    fn release_all_inputs(&self) {
+    fn release_all_inputs(&mut self) {
         let Some(tx) = &self.input_tx else { return };
 
         // ── 수정 키 해제 ────────────────────────────────────────────────────
@@ -390,10 +401,15 @@ impl ViewerApp {
             });
         }
 
-        // ── 마우스 버튼 해제 ────────────────────────────────────────────────
-        for btn in [0u32, 2, 4] { // Left, Right, Middle
-            let _ = tx.send(InputEvent::MouseButton { button: btn, pressed: false });
+        // ── 마우스 버튼 해제 (실제로 눌린 버튼만) ──────────────────────────
+        // 무조건 UP을 보내면 remote에서 우클릭 등 오발이 발생하므로 추적된 것만 해제
+        const BTN_MAP: &[(u8, u32)] = &[(0b001, 0), (0b010, 2), (0b100, 4)];
+        for &(bit, btn) in BTN_MAP {
+            if self.mouse_btns & bit != 0 {
+                let _ = tx.send(InputEvent::MouseButton { button: btn, pressed: false });
+            }
         }
+        self.mouse_btns = 0;
 
         hbb_common::log::debug!("[display] 모든 입력 강제 해제 전송");
     }
@@ -617,6 +633,30 @@ fn draw_control_border(buf: &mut softbuffer::Buffer<'_, Arc<Window>, Arc<Window>
     }
 }
 
+/// 마우스 위치에 따라 커서 아이콘 결정
+/// - 창 가장자리(12px 이내): 방향별 리사이즈 커서
+/// - 중앙 + 제어 모드: Crosshair
+/// - 중앙 + 비제어 모드: Default
+fn cursor_for_pos(x: i32, y: i32, win_w: u32, win_h: u32, _control_active: bool) -> CursorIcon {
+    const EDGE: i32 = 12;
+    let at_left   = x < EDGE;
+    let at_right  = x >= win_w as i32 - EDGE;
+    let at_top    = y < EDGE;
+    let at_bottom = y >= win_h as i32 - EDGE;
+
+    match (at_top, at_bottom, at_left, at_right) {
+        (true,  _,     true,  _    ) => CursorIcon::NwResize,
+        (true,  _,     _,     true ) => CursorIcon::NeResize,
+        (_,     true,  true,  _    ) => CursorIcon::SwResize,
+        (_,     true,  _,     true ) => CursorIcon::SeResize,
+        (true,  _,     _,     _    ) => CursorIcon::NResize,
+        (_,     true,  _,     _    ) => CursorIcon::SResize,
+        (_,     _,     true,  _    ) => CursorIcon::WResize,
+        (_,     _,     _,     true ) => CursorIcon::EResize,
+        _                            => CursorIcon::Default,
+    }
+}
+
 /// Windows: 현재 메시지가 에이전트 SendInput 주입인지 확인
 /// 에이전트는 dwExtraInfo=0x5DEC_0001 로 마킹한다.
 /// 뷰어가 이 값을 보면 피드백 루프로 돌아온 이벤트이므로 무시한다.
@@ -740,6 +780,7 @@ pub fn run_event_loop(
         mouse_global,
         scroll_x:        0,
         scroll_y:        0,
+        mouse_btns:      0,
     };
 
     // Wait: 프레임/입력 이벤트가 있을 때만 루프 실행

@@ -28,12 +28,16 @@ VP9 requires **libvpx via vcpkg** (`x64-windows-static` triplet). Set `VCPKG_ROO
 
 ```powershell
 # Terminal 1 — agent (same PC)
-.\run_agent_direct.ps1          # default: port 20020, key "direct"
+.\run_agent_direct.ps1                          # default: port 20020, key "direct"
+.\run_agent_direct.ps1 -Port 20021 -Key mykey  # custom port/key
 
 # Terminal 2 — viewer
 .\run_viewer_direct.ps1                              # 127.0.0.1:20020
 .\run_viewer_direct.ps1 -AgentHost "192.168.1.100"  # remote agent
+.\run_viewer_direct.ps1 -AgentHost "192.168.1.100" -Port 20021 -Key mykey
 ```
+
+Script params: `run_agent_direct.ps1 [-Key str] [-Port str] [-LogLevel str]`; `run_viewer_direct.ps1 [-AgentHost str] [-Port str] [-Key str] [-LogLevel str]`
 
 Relevant env vars:
 - `VDESK_DIRECT=1` — skip backend, use direct TCP
@@ -42,6 +46,7 @@ Relevant env vars:
 - `AGENT_PORT` — agent listen port (default: 20020)
 - `AGENT_NO_INJECT=1` — disable `SendInput` (streaming-only test)
 - `VDESK_MOUSE_GLOBAL=1` — send mouse as virtual-screen absolute coords (0x07) even in backend mode
+- `RUST_LOG` — log verbosity (e.g. `info`, `debug`, `vdesk_agent=trace`)
 
 ## Running — Backend Mode
 
@@ -50,11 +55,17 @@ Relevant env vars:
 .\run_agent_local.ps1           # sets AGENT_RELAY_IP=127.0.0.1
 
 # Viewer
+.\run_viewer_local.ps1 -Email "user@example.com" -Password "pass" -Device 42
+# or manually:
 $env:VDESK_API_URL="http://localhost:8080"
 $env:VDESK_EMAIL="user@example.com"
 $env:VDESK_PASSWORD="pass"
 .\target\release\vdesk_viewer.exe --device 42
 ```
+
+Script params: `run_agent_local.ps1 [-ApiUrl str] [-Port str] [-LogLevel str]`; `run_viewer_local.ps1 [-ApiUrl str] [-Email str] [-Password str] [-Device str] [-LogLevel str]`
+
+**Viewer interactive device selection** (when `--device` is omitted): viewer lists linked devices → prompts for ID. If no linked devices, it calls the discover endpoint, lists unlinked agents, and calls `link_device` before connecting. Credentials can also be entered interactively if env vars are not set.
 
 ## Distribution (viewer only)
 
@@ -149,6 +160,8 @@ This prevents `DuplicateOutput` failure on quick reconnect. `video_tx` (original
 
 | File | Purpose |
 |------|---------|
+| `vdesk_agent/src/api.rs` | All HTTP request/response types + async backend API calls (register, heartbeat, poll, activate, end) |
+| `vdesk_viewer/src/api.rs` | Viewer-side HTTP calls: login, create session, fetch relay, end session |
 | `vdesk_agent/src/main.rs` | Registration + heartbeat + poll/activate loop; direct-mode entry |
 | `vdesk_agent/src/server.rs` | TCP listener; `listen_loop` (backend) + `listen_loop_direct` (direct) |
 | `vdesk_agent/src/session.rs` | Per-session: VP9 frame send + input receive/dispatch + capture lifecycle |
@@ -171,3 +184,4 @@ This prevents `DuplicateOutput` failure on quick reconnect. `video_tx` (original
 - winit 0.30 requires `ApplicationHandler` trait; the event loop must run on the main thread. The session TCP loop runs in a spawned thread with its own `tokio::runtime::Runtime`.
 - `reqwest::blocking` must not be dropped inside a `block_on` context — the viewer drops `rt` before calling `end_session`.
 - VP9 C wrappers (`vpx_wrap.c`) are compiled via `cc` crate in `build.rs`; both agent and viewer have their own copy.
+- Agent's device UUID (`localBox`) persists across restarts in `%TEMP%\vdesk_agent_id`. Delete this file to force a fresh registration with the backend.

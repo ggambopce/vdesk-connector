@@ -219,7 +219,7 @@ impl DxgiCapture {
             let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = mem::zeroed();
 
             let hr = (*self.duplication.0).AcquireNextFrame(
-                33, // ms timeout (약 30fps 간격)
+                16, // ms timeout (약 60fps 간격)
                 &mut frame_info,
                 &mut frame_resource,
             );

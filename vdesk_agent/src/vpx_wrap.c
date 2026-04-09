@@ -63,7 +63,7 @@ VpxEncHandle* vpx_enc_create_ex(int w, int h, int bitrate_kbps, int fps, int *ou
     handle->cfg.rc_end_usage       = VPX_CBR;
     handle->cfg.rc_target_bitrate  = (unsigned)bitrate_kbps;
     handle->cfg.rc_min_quantizer   = 4;
-    handle->cfg.rc_max_quantizer   = 56;
+    handle->cfg.rc_max_quantizer   = 48;
     handle->cfg.rc_undershoot_pct  = 95;
     handle->cfg.rc_overshoot_pct   = 5;
     handle->cfg.rc_buf_sz          = 1000;
@@ -83,10 +83,11 @@ VpxEncHandle* vpx_enc_create_ex(int w, int h, int bitrate_kbps, int fps, int *ou
         return NULL;
     }
 
-    vpx_codec_control(&handle->ctx, VP8E_SET_CPUUSED, 6);
+    vpx_codec_control(&handle->ctx, VP8E_SET_CPUUSED, 5);
     vpx_codec_control(&handle->ctx, VP9E_SET_ROW_MT, 1);
     vpx_codec_control(&handle->ctx, VP9E_SET_TILE_COLUMNS, 1);
     vpx_codec_control(&handle->ctx, VP9E_SET_AQ_MODE, 3);
+    vpx_codec_control(&handle->ctx, VP8E_SET_SCREEN_CONTENT_MODE, 1);
 
     if (!vpx_img_alloc(&handle->img, VPX_IMG_FMT_I420, (unsigned)w, (unsigned)h, 1)) {
         set_last_err(&handle->ctx, "vpx_img_alloc");

@@ -5,7 +5,7 @@
 param(
     [string]$AgentHost = "127.0.0.1",
     [string]$Port      = "20020",
-    [string]$Key       = "direct",
+    [string]$Key       = "mykey",
     [string]$LogLevel  = "info"
 )
 
