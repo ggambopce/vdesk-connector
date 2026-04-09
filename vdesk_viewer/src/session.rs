@@ -77,10 +77,22 @@ pub async fn run(
                 }
             }
             Some(input) = input_rx.recv() => {
+                // 한/영·한자 키는 info 레벨로 로그
+                let is_hangul = matches!(&input,
+                    crate::display::InputEvent::KeyVk { vk, .. } if *vk == 0x15 || *vk == 0x19
+                );
+                if is_hangul {
+                    log::info!("[session] ★한영/한자 KeyVk 수신 → 에이전트로 전송: {:?}", input);
+                }
                 if let Some(data) = input_to_bytes(input) {
+                    if is_hangul {
+                        log::info!("[session] ★한영/한자 직렬화 {} bytes: {:02X?}", data.len(), &data);
+                    }
                     if let Err(e) = stream.send_bytes(bytes::Bytes::from(data)).await {
                         log::warn!("[session] 입력 전송 오류: {:?}", e);
                         break;
+                    } else if is_hangul {
+                        log::info!("[session] ★한영/한자 TCP 전송 완료");
                     }
                 }
             }

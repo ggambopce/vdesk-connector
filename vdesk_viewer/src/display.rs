@@ -299,6 +299,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 }
             }
 
+            // 제어 모드 중 로컬 IME 이벤트 무시 — 에이전트측 IME가 한글 조합 담당
+            WindowEvent::Ime(_) => {}
+
             _ => {}
         }
     }
@@ -459,7 +462,12 @@ impl ViewerApp {
         }
         let h = unsafe { SetWindowsHookExA(13, global_kb::hook_proc, 0, 0) }; // WH_KEYBOARD_LL=13
         global_kb::HOOK.store(h, std::sync::atomic::Ordering::Relaxed);
-        hbb_common::log::info!("[display] 글로벌 키보드 훅 설치 (h={})", h);
+        let tx_ok = !global_kb::TX_PTR.load(std::sync::atomic::Ordering::Relaxed).is_null();
+        if h != 0 {
+            hbb_common::log::info!("[display] 글로벌 키보드 훅 설치 성공 (h={}, tx_ok={})", h, tx_ok);
+        } else {
+            hbb_common::log::warn!("[display] 글로벌 키보드 훅 설치 실패 (h=0, tx_ok={})", tx_ok);
+        }
     }
     #[cfg(not(target_os = "windows"))]
     fn install_kb_hook(&self) {}
@@ -774,6 +782,7 @@ fn set_exclude_from_capture(window: &Window) {
     }
 }
 
+
 /// 글로벌 저수준 키보드 훅 — 뷰어 포커스 없이도 모든 키 입력 캡처
 /// ESC·F11은 로컬 처리를 위해 패스스루. 나머지는 에이전트로 전달 후 로컬 억제.
 #[cfg(target_os = "windows")]
@@ -802,22 +811,52 @@ mod global_kb {
         fn CallNextHookEx(h: isize, code: i32, w: usize, l: isize) -> isize;
     }
 
+    const VK_HANGUL: u32 = 0x15;
+    const VK_HANJA:  u32 = 0x19;
+
     /// LL 키보드 훅 프로시저 — winit 메인 스레드에서 실행
     pub unsafe extern "system" fn hook_proc(code: i32, w: usize, l: isize) -> isize {
         if code == HC_ACTION {
             let kb = &*(l as *const KbdHook);
             // 에이전트가 주입한 이벤트는 패스스루 (뷰어에서 마커로 무시됨)
             if kb.extra != MARK {
+                let pressed = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
+                let extended = (kb.flags & LLKHF_EXT) != 0;
+
+                // 한/영·한자 키: 항상 info 레벨로 로그 (디버깅 핵심)
+                if kb.vk == VK_HANGUL || kb.vk == VK_HANJA {
+                    hbb_common::log::info!(
+                        "[hook] ★한영/한자 키 vk=0x{:02X} scan=0x{:02X} flags=0x{:02X} pressed={}",
+                        kb.vk, kb.scan, kb.flags, pressed
+                    );
+                }
+
                 // ESC, F11 은 로컬 처리 유지
                 if kb.vk != VK_ESCAPE && kb.vk != VK_F11 {
+                    // 그 외 키: debug 레벨
+                    if kb.vk != VK_HANGUL && kb.vk != VK_HANJA {
+                        hbb_common::log::debug!(
+                            "[hook] vk=0x{:02X} scan=0x{:02X} flags=0x{:02X} pressed={}",
+                            kb.vk, kb.scan, kb.flags, pressed
+                        );
+                    }
+
                     let ptr = TX_PTR.load(std::sync::atomic::Ordering::Relaxed);
                     if !ptr.is_null() {
-                        let _ = (*ptr).send(InputEvent::KeyVk {
-                            vk:       kb.vk,
-                            scan:     kb.scan as u16,
-                            pressed:  w == WM_KEYDOWN || w == WM_SYSKEYDOWN,
-                            extended: (kb.flags & LLKHF_EXT) != 0,
+                        let result = (*ptr).send(InputEvent::KeyVk {
+                            vk: kb.vk,
+                            scan: kb.scan as u16,
+                            pressed,
+                            extended,
                         });
+                        if kb.vk == VK_HANGUL || kb.vk == VK_HANJA {
+                            match result {
+                                Ok(_)  => hbb_common::log::info!("[hook] ★한영/한자 채널 전송 성공"),
+                                Err(e) => hbb_common::log::warn!("[hook] ★한영/한자 채널 전송 실패: {:?}", e),
+                            }
+                        }
+                    } else if kb.vk == VK_HANGUL || kb.vk == VK_HANJA {
+                        hbb_common::log::warn!("[hook] ★한영/한자 — TX_PTR is null! 채널 없음");
                     }
                     return 1; // 로컬 앱에 전달하지 않음
                 }

@@ -225,6 +225,10 @@ fn handle_input(bytes: &[u8], out_tx: &mpsc::Sender<Bytes>) {
             let scan     = u16::from_be_bytes(bytes[5..7].try_into().unwrap());
             let pressed  = bytes[7] != 0;
             let extended = bytes.get(8).copied().unwrap_or(0) != 0;
+            if vk == 0x15 || vk == 0x19 {
+                log::info!("[agent-session] ★한영/한자 KeyVk 수신: vk=0x{:02X} scan=0x{:02X} pressed={} extended={}",
+                    vk, scan, pressed, extended);
+            }
             inp::inject_key_vk(vk, scan, pressed, extended);
         }
         IN_PING if bytes.len() >= 9 => {

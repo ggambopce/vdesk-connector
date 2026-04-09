@@ -2,7 +2,8 @@
 //!
 //! 마우스 좌표: 뷰어가 보낸 창 크기(win_w, win_h)로 실시간 스케일 계산.
 //! 스크롤: MOUSEEVENTF_WHEEL(세로) / MOUSEEVENTF_HWHEEL(가로), 단위 = Windows notch(120).
-//! 문자 입력: KEYEVENTF_UNICODE — 한글·IME 완성 문자 포함.
+//! 키보드: 글로벌 훅 경유 VK 코드 주입. 한/영(VK_HANGUL=0x15), 한자(VK_HANJA=0x19) 키는
+//!         KEYEVENTF_EXTENDEDKEY 없이 주입해야 Korean IME가 토글 이벤트로 인식한다.
 //!
 //! 로컬 테스트 모드 (AGENT_NO_INJECT=1 또는 루프백 IP):
 //!   에이전트와 뷰어가 같은 PC에서 실행될 때 입력 주입을 비활성화합니다.
@@ -186,24 +187,40 @@ mod win {
             return;
         }
 
+        // VK_HANGUL(0x15), VK_HANJA(0x19) 는 KEYEVENTF_EXTENDEDKEY 없이 주입해야
+        // Windows Korean IME 가 토글 이벤트로 인식한다.
+        // 한국 키보드의 한/영·한자 키는 E0 접두어 확장 스캔코드이므로 훅에서
+        // extended=true 로 오지만, SendInput 에서는 플래그를 제거해야 동작한다.
+        const VK_HANGUL: u32 = 0x15;
+        const VK_HANJA:  u32 = 0x19;
+        let is_ime_toggle = vk == VK_HANGUL || vk == VK_HANJA;
+
+        let mut flags = if pressed { 0 } else { KEYEVENTF_KEYUP };
+        if extended && !is_ime_toggle { flags |= KEYEVENTF_EXTENDEDKEY; }
+
+        if is_ime_toggle {
+            log::info!(
+                "[input] ★한영/한자 SendInput: vk=0x{:02X} scan=0x{:02X} flags=0x{:02X} pressed={}",
+                vk, scan, flags, pressed
+            );
+        }
+
         unsafe {
             let mut inp: INPUT = mem::zeroed();
             inp.type_ = INPUT_KEYBOARD;
 
-            if false {
-            } else {
-                let mut flags = if pressed { 0 } else { KEYEVENTF_KEYUP };
-                if extended { flags |= KEYEVENTF_EXTENDEDKEY; }
-                *inp.u.ki_mut() = KEYBDINPUT {
-                    wVk:         vk as u16,
-                    wScan:       scan,
-                    dwFlags:     flags,
-                    time:        0,
-                    dwExtraInfo: VDESK_INPUT_MARK,
-                };
-            }
+            *inp.u.ki_mut() = KEYBDINPUT {
+                wVk:         vk as u16,
+                wScan:       scan,
+                dwFlags:     flags,
+                time:        0,
+                dwExtraInfo: VDESK_INPUT_MARK,
+            };
 
-            SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);
+            let r = SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);
+            if is_ime_toggle {
+                log::info!("[input] ★한영/한자 SendInput 결과: {} (1=성공)", r);
+            }
         }
     }
 

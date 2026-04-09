@@ -115,6 +115,8 @@ DXGI Desktop Duplication (BGRA, GPU→CPU)
 
 VP9 bitrate: `VDESK_VP9_BITRATE_KBPS` env var (default 8000 kbps). Falls back to JPEG if VP9 init fails.
 
+**VP9 encoder settings** (`vpx_wrap.c`): `cpu_used=5` (quality/speed balance), `rc_max_quantizer=48` (minimum quality floor), `VP8E_SET_SCREEN_CONTENT_MODE=1` (desktop UI optimized), `kf_max_dist=fps*3`, CBR mode. `AcquireNextFrame` timeout is 16ms (~60fps cap).
+
 **DirtyRects optimization**: `DxgiCapture::capture()` calls `GetFrameDirtyRects` after each `AcquireNextFrame`. If dirty area < 50% of screen, uses `CopySubresourceRegion` per rect instead of full `CopyResource`, and `bgra_to_i420_rects()` converts only those regions. The I420 buffer persists across frames.
 
 ### Wire Protocol
@@ -123,6 +125,7 @@ VP9 bitrate: `VDESK_VP9_BITRATE_KBPS` env var (default 8000 kbps). Falls back to
 - `0x10` Init: `[width(4BE), height(4BE), fps(1), codec(1)]` — first message; codec `1`=VP9, `0`=JPEG
 - `0x11` Frame: `[is_key(1), data_len(4BE), vp9_or_jpeg_data]` — per frame
 - `0x12` Pong: `[timestamp(8BE)]`
+- `0x13` CursorShape: `[cursor_type(1)]` — 0=Arrow 1=IBeam 2=SizeWE 3=SizeNS 4=SizeNWSE 5=SizeNESW 6=SizeAll 7=Hand 8=Wait 9=No; sent every 50ms when changed
 
 **Viewer → Agent:**
 - `0x01` MouseMove: `[x(4BE), y(4BE), win_w(2BE), win_h(2BE)]` — viewer window coords
@@ -143,10 +146,15 @@ VP9 bitrate: `VDESK_VP9_BITRATE_KBPS` env var (default 8000 kbps). Falls back to
 ### Remote Control Mode (viewer)
 
 - **Off**: no input sent; title shows "클릭하여 원격 제어"
-- **On** (left-click to enter): `CursorGrabMode::Confined`; green 4px border; all mouse/keyboard forwarded
+- **On** (left-click to enter): `CursorGrabMode::Confined` (`ClipCursor`); green 4px border; all mouse/keyboard forwarded
 - **Release**: Escape key or window close
 - **F11**: fullscreen toggle (always local, never forwarded)
 - `WDA_EXCLUDEFROMCAPTURE` applied on window creation — prevents viewer window from appearing in agent's screen capture
+- **Cursor mirroring**: agent polls `GetCursorInfo` every 50ms, sends `0x13` when type changes; viewer stores in `display::REMOTE_CURSOR_TYPE` (`AtomicU8`) and applies via `SetCursor(LoadCursorW(...))` directly (winit `set_cursor` is overridden by `WM_SETCURSOR` after grab)
+- **Viewer edge resize**: cursor at 12px edge zone → `at_edge=true`; mouse move not forwarded to agent; left-click triggers `ReleaseCapture + ClipCursor(NULL) + WM_NCLBUTTONDOWN` for OS resize loop; `Resized` event restores `CursorGrabMode::Confined`. Grab is **never** released in `CursorMoved` — only in `trigger_edge_resize`.
+- **Mouse button tracking**: `mouse_btns: u8` bitmask (bit0=Left, bit1=Right, bit2=Middle); `release_all_inputs` only sends UP events for buttons that are actually down — prevents spurious right-click on ESC
+- **Global keyboard hook**: `SetWindowsHookExA(WH_KEYBOARD_LL)` installed on control mode enter; captures all keys regardless of focus; ESC and F11 pass through to local handler; removed on mode exit
+- **Korean IME (한/영 key)**: viewer disables local IME via `ImmAssociateContextEx(hwnd, 0, 0)` on control enter (re-enables on exit); hook suppresses 한/영 locally and sends `KeyVk(VK_HANGUL=0x15)` to agent; agent's `inject_key_vk` strips `KEYEVENTF_EXTENDEDKEY` for VK_HANGUL/VK_HANJA so remote Windows Korean IME recognizes the toggle event. Korean character composition is handled by the remote IME from raw VK codes.
 
 ### Session Lifecycle & Reconnect
 
