@@ -26,7 +26,7 @@ use winit::{
     application::ApplicationHandler,
     event::{
         DeviceEvent, DeviceId, ElementState, KeyEvent as WinitKeyEvent,
-        MouseButton, MouseScrollDelta, WindowEvent,
+        MouseButton, MouseScrollDelta, RawKeyEvent, WindowEvent,
     },
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
@@ -310,9 +310,33 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         &mut self,
         _event_loop: &ActiveEventLoop,
         _device_id: DeviceId,
-        _event: DeviceEvent,
+        event: DeviceEvent,
     ) {
-        // 제어 모드에서 Confined grab — 상대 이동은 CursorMoved로 처리
+        // WH_KEYBOARD_LL 훅이 가로채지 못하는 한/영·한자 키를
+        // Raw Input(DeviceEvent::Key) 경로로 처리한다.
+        // Korean IME가 WM_KEYDOWN 전에 처리하는 키도 이 경로에서는 스캔코드로 수신된다.
+        if !self.control_active { return; }
+        if let DeviceEvent::Key(RawKeyEvent {
+            physical_key: PhysicalKey::Code(code),
+            state,
+        }) = event {
+            let vk: Option<u32> = match code {
+                KeyCode::Lang1 => Some(0x15), // VK_HANGUL  한/영
+                KeyCode::Lang2 => Some(0x19), // VK_HANJA   한자
+                _ => None,
+            };
+            if let Some(vk) = vk {
+                let pressed = state == ElementState::Pressed;
+                if let Some(tx) = &self.input_tx {
+                    let _ = tx.send(InputEvent::KeyVk {
+                        vk,
+                        scan: 0,
+                        pressed,
+                        extended: false,
+                    });
+                }
+            }
+        }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: ViewerEvent) {
@@ -811,9 +835,6 @@ mod global_kb {
         fn CallNextHookEx(h: isize, code: i32, w: usize, l: isize) -> isize;
     }
 
-    const VK_HANGUL: u32 = 0x15;
-    const VK_HANJA:  u32 = 0x19;
-
     /// LL 키보드 훅 프로시저 — winit 메인 스레드에서 실행
     pub unsafe extern "system" fn hook_proc(code: i32, w: usize, l: isize) -> isize {
         if code == HC_ACTION {
@@ -823,40 +844,21 @@ mod global_kb {
                 let pressed = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
                 let extended = (kb.flags & LLKHF_EXT) != 0;
 
-                // 한/영·한자 키: 항상 info 레벨로 로그 (디버깅 핵심)
-                if kb.vk == VK_HANGUL || kb.vk == VK_HANJA {
-                    hbb_common::log::info!(
-                        "[hook] ★한영/한자 키 vk=0x{:02X} scan=0x{:02X} flags=0x{:02X} pressed={}",
-                        kb.vk, kb.scan, kb.flags, pressed
-                    );
-                }
-
                 // ESC, F11 은 로컬 처리 유지
                 if kb.vk != VK_ESCAPE && kb.vk != VK_F11 {
-                    // 그 외 키: debug 레벨
-                    if kb.vk != VK_HANGUL && kb.vk != VK_HANJA {
-                        hbb_common::log::debug!(
-                            "[hook] vk=0x{:02X} scan=0x{:02X} flags=0x{:02X} pressed={}",
-                            kb.vk, kb.scan, kb.flags, pressed
-                        );
-                    }
+                    hbb_common::log::debug!(
+                        "[hook] vk=0x{:02X} scan=0x{:02X} flags=0x{:02X} pressed={}",
+                        kb.vk, kb.scan, kb.flags, pressed
+                    );
 
                     let ptr = TX_PTR.load(std::sync::atomic::Ordering::Relaxed);
                     if !ptr.is_null() {
-                        let result = (*ptr).send(InputEvent::KeyVk {
+                        let _ = (*ptr).send(InputEvent::KeyVk {
                             vk: kb.vk,
                             scan: kb.scan as u16,
                             pressed,
                             extended,
                         });
-                        if kb.vk == VK_HANGUL || kb.vk == VK_HANJA {
-                            match result {
-                                Ok(_)  => hbb_common::log::info!("[hook] ★한영/한자 채널 전송 성공"),
-                                Err(e) => hbb_common::log::warn!("[hook] ★한영/한자 채널 전송 실패: {:?}", e),
-                            }
-                        }
-                    } else if kb.vk == VK_HANGUL || kb.vk == VK_HANJA {
-                        hbb_common::log::warn!("[hook] ★한영/한자 — TX_PTR is null! 채널 없음");
                     }
                     return 1; // 로컬 앱에 전달하지 않음
                 }

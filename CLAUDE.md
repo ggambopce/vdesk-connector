@@ -155,6 +155,7 @@ VP9 bitrate: `VDESK_VP9_BITRATE_KBPS` env var (default 8000 kbps). Falls back to
 - **Mouse button tracking**: `mouse_btns: u8` bitmask (bit0=Left, bit1=Right, bit2=Middle); `release_all_inputs` only sends UP events for buttons that are actually down — prevents spurious right-click on ESC
 - **Global keyboard hook**: `SetWindowsHookExA(WH_KEYBOARD_LL)` installed on control mode enter; captures all keys regardless of focus; ESC and F11 pass through to local handler; removed on mode exit
 - **Korean IME (한/영 key)**: viewer disables local IME via `ImmAssociateContextEx(hwnd, 0, 0)` on control enter (re-enables on exit); hook suppresses 한/영 locally and sends `KeyVk(VK_HANGUL=0x15)` to agent; agent's `inject_key_vk` strips `KEYEVENTF_EXTENDEDKEY` for VK_HANGUL/VK_HANJA so remote Windows Korean IME recognizes the toggle event. Korean character composition is handled by the remote IME from raw VK codes.
+- **Korean IME Raw Input fallback**: `device_event` handler also listens for `DeviceEvent::Key` with `KeyCode::Lang1` (→ VK_HANGUL 0x15) and `KeyCode::Lang2` (→ VK_HANJA 0x19). This handles cases where `WH_KEYBOARD_LL` fails to intercept these keys before the Korean IME processes them — the Raw Input path receives the scan code regardless of IME state.
 
 ### Session Lifecycle & Reconnect
 

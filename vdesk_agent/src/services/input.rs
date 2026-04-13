@@ -198,13 +198,6 @@ mod win {
         let mut flags = if pressed { 0 } else { KEYEVENTF_KEYUP };
         if extended && !is_ime_toggle { flags |= KEYEVENTF_EXTENDEDKEY; }
 
-        if is_ime_toggle {
-            log::info!(
-                "[input] ★한영/한자 SendInput: vk=0x{:02X} scan=0x{:02X} flags=0x{:02X} pressed={}",
-                vk, scan, flags, pressed
-            );
-        }
-
         unsafe {
             let mut inp: INPUT = mem::zeroed();
             inp.type_ = INPUT_KEYBOARD;
@@ -217,10 +210,7 @@ mod win {
                 dwExtraInfo: VDESK_INPUT_MARK,
             };
 
-            let r = SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);
-            if is_ime_toggle {
-                log::info!("[input] ★한영/한자 SendInput 결과: {} (1=성공)", r);
-            }
+            SendInput(1, &mut inp, mem::size_of::<INPUT>() as i32);
         }
     }
 
