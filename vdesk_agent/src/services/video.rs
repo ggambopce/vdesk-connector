@@ -169,13 +169,19 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
             }
         };
 
-        // 변화 감지 (FNV 샘플 해시) — 전체 프레임이 아닐 때만 (부분 캡처 시 전체 해시는 의미 없음)
+        // 변화 감지 (FNV 샘플 해시)
+        // - is_full_frame=false(부분 캡처): 항상 전송 (변경 영역 확실)
+        // - is_full_frame=true + has_dirty_rects=false(DirtyRects 없음):
+        //     LastPresentTime != 0 이므로 화면이 바뀐 것은 확실하나 위치를 모름.
+        //     해시 샘플링이 작은 변경을 놓칠 수 있으므로 스킵 금지.
+        // - is_full_frame=true + has_dirty_rects=true(dirty 면적 >= 50%):
+        //     화면 절반 이상 변경 → 해시가 변화를 감지할 확률이 높아 스킵 적용.
         let force_key = frames % (TARGET_FPS * 3) == 0;
         if frame.is_full_frame {
             let hash = fnv_sample(frame.bgra);
             let is_static = hash == last_hash;
             last_hash = hash;
-            if is_static && !force_key {
+            if is_static && !force_key && frame.has_dirty_rects {
                 continue;
             }
         }

@@ -58,9 +58,13 @@ impl<T> Drop for ComPtr<T> {
 
 /// capture() 가 반환하는 프레임 정보
 pub struct CaptureFrame<'a> {
-    pub bgra:         &'a [u8],
-    pub is_full_frame: bool,
-    pub dirty_rects:  &'a [DirtyRect],
+    pub bgra:             &'a [u8],
+    pub is_full_frame:    bool,
+    pub dirty_rects:      &'a [DirtyRect],
+    /// DXGI가 DirtyRects 정보를 제공했는지 여부.
+    /// false(num_rects==0)이면 어느 영역이 바뀌었는지 알 수 없으므로
+    /// 해시 스킵을 적용하면 안 됨.
+    pub has_dirty_rects:  bool,
 }
 
 // ── DxgiCapture ─────────────────────────────────────────────────────────────
@@ -76,6 +80,7 @@ pub struct DxgiCapture {
     dirty_rects_raw:  Vec<RECT>,      // winapi RECT 임시 버퍼
     dirty_rects:      Vec<DirtyRect>, // 현재 프레임의 변경 영역
     is_full_frame:    bool,
+    has_dirty_rects:  bool,           // 현재 프레임에 DirtyRects 정보가 있는지
     first_frame:      bool,
 }
 
@@ -181,6 +186,7 @@ impl DxgiCapture {
                 dirty_rects_raw:  Vec::new(),
                 dirty_rects:      Vec::new(),
                 is_full_frame:    true,
+                has_dirty_rects:  false,
                 first_frame:      true,
             })
         }
@@ -261,6 +267,8 @@ impl DxgiCapture {
                 (r.right - r.left).max(0) as i64 * (r.bottom - r.top).max(0) as i64
             }).sum();
             let use_full_copy = self.first_frame || num_rects == 0 || dirty_area * 2 >= screen_area;
+            // num_rects==0이면 어느 영역이 바뀌었는지 모름 → 해시 스킵 금지
+            self.has_dirty_rects = num_rects > 0;
 
             // IDXGIResource → ID3D11Texture2D
             let mut desktop_tex: *mut ID3D11Texture2D = ptr::null_mut();
@@ -369,9 +377,10 @@ impl DxgiCapture {
             self.first_frame = false;
 
             Ok(Some(CaptureFrame {
-                bgra:          &self.buf,
-                is_full_frame: self.is_full_frame,
-                dirty_rects:   &self.dirty_rects,
+                bgra:            &self.buf,
+                is_full_frame:   self.is_full_frame,
+                dirty_rects:     &self.dirty_rects,
+                has_dirty_rects: self.has_dirty_rects,
             }))
         }
     }
