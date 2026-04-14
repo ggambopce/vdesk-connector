@@ -2,15 +2,27 @@
 //!
 //! AgentState 전환:
 //!   Pending ──[핸드쉐이크 성공]──► Streaming ──[세션 종료]──► Idle
-//!   Pending ──[핸드쉐이크 실패]──► Idle
+//!   Pending ──[핸드쉐이크 실패]──► Idle  (재폴링 허용)
 
 use anyhow::Result;
 use hbb_common::{log, tcp::FramedStream, tokio::net::TcpListener};
+use serde::Deserialize;
 use std::net::SocketAddr;
 
 use crate::state::{AgentState, SharedState};
 
 pub const LISTEN_PORT: u16 = 20020;
+
+/// 뷰어가 TCP 핸드쉐이크 시 전송하는 JSON 메시지
+#[derive(Deserialize, Debug)]
+struct HandshakeMsg {
+    #[serde(rename = "sessionKey")]
+    session_key: String,
+    #[serde(rename = "connectToken")]
+    connect_token: String,
+    #[serde(rename = "viewerNonce")]
+    viewer_nonce: String,
+}
 
 /// TCP 연결 수락 루프 — Pending 상태에서만 연결 처리
 pub async fn listen_loop(state: SharedState) -> Result<()> {
@@ -26,11 +38,13 @@ pub async fn listen_loop(state: SharedState) -> Result<()> {
     loop {
         let (tcp_stream, peer_addr) = listener.accept().await?;
 
-        // Pending 상태일 때만 연결 허용 — expected session key 가져오기
-        let expected_key = {
+        // Pending 상태일 때만 연결 허용 — session_key, device_key 가져오기
+        let pending_info = {
             let s = state.lock().unwrap();
             match &*s {
-                AgentState::Pending { session_key } => Some(session_key.clone()),
+                AgentState::Pending { session_key, device_key } => {
+                    Some((session_key.clone(), device_key.clone()))
+                }
                 other => {
                     log::warn!(
                         "[server] {:?} 상태 — 연결 거부: {}",
@@ -42,8 +56,8 @@ pub async fn listen_loop(state: SharedState) -> Result<()> {
             }
         };
 
-        let expected_key = match expected_key {
-            Some(k) => k,
+        let (expected_key, device_key) = match pending_info {
+            Some(info) => info,
             None => continue,
         };
 
@@ -52,11 +66,12 @@ pub async fn listen_loop(state: SharedState) -> Result<()> {
 
         let local_addr = tcp_stream.local_addr()?;
         let state_task = state.clone();
+        let viewer_ip = peer_addr.ip().to_string();
 
         tokio::spawn(async move {
             let mut stream = FramedStream::from(tcp_stream, local_addr);
 
-            match handshake(&mut stream, &expected_key).await {
+            match handshake(&mut stream, &expected_key, &device_key, &viewer_ip).await {
                 Ok(session_key) => {
                     log::info!("[server] 핸드쉐이크 성공 → Streaming: {}", session_key);
                     // Pending → Streaming
@@ -64,7 +79,7 @@ pub async fn listen_loop(state: SharedState) -> Result<()> {
                         session_key: session_key.clone(),
                     };
 
-                    if let Err(e) = crate::session::run(stream, session_key).await {
+                    if let Err(e) = crate::session::run(stream, session_key, device_key).await {
                         log::error!("[session] 세션 오류: {:?}", e);
                     }
 
@@ -100,13 +115,14 @@ pub async fn listen_loop_direct(fixed_key: String) -> Result<()> {
         tcp_stream.set_nodelay(true).ok();
 
         let local_addr = tcp_stream.local_addr()?;
+        let viewer_ip = peer_addr.ip().to_string();
 
-        // spawn 없이 인라인 실행 — 세션이 완전히 종료(DXGI 핸들 해제)된 후 다음 연결 수락
+        // 다이렉트 모드에서는 verify-connect 없이 sessionKey만 확인
         let mut stream = FramedStream::from(tcp_stream, local_addr);
-        match handshake(&mut stream, &fixed_key).await {
+        match handshake_direct(&mut stream, &fixed_key).await {
             Ok(session_key) => {
                 log::info!("[server] 핸드쉐이크 성공 → 스트리밍 시작");
-                if let Err(e) = crate::session::run(stream, session_key).await {
+                if let Err(e) = crate::session::run(stream, session_key, viewer_ip).await {
                     log::error!("[session] 세션 오류: {:?}", e);
                 }
                 log::info!("[server] 세션 종료 — 다음 연결 대기");
@@ -116,31 +132,94 @@ pub async fn listen_loop_direct(fixed_key: String) -> Result<()> {
     }
 }
 
-/// 세션 키 핸드쉐이크: 뷰어가 보낸 sessionKey 검증 후 0x01/0x00 응답
-///
-/// 검증 방식: 뷰어가 보낸 sessionKey를 activate() 응답으로 얻은 expected_key와 비교.
-/// relay API 재검증은 하지 않음 — 해당 endpoint가 뷰어 JWT 쿠키를 요구하여 에이전트가
-/// 인증 없이 호출하면 404를 반환하기 때문. activate() 성공 자체가 세션 유효성 보증.
-async fn handshake(stream: &mut FramedStream, expected_key: &str) -> Result<String> {
+/// JSON 핸드쉐이크: 뷰어가 보낸 {sessionKey, connectToken, viewerNonce} 검증
+/// 1차 로컬 검증(sessionKey 일치) 후 서버 API verify-connect 호출로 최종 승인
+async fn handshake(
+    stream: &mut FramedStream,
+    expected_key: &str,
+    device_key: &str,
+    viewer_ip: &str,
+) -> Result<String> {
     let bytes = match stream.next().await {
         Some(Ok(b)) => b,
         Some(Err(e)) => anyhow::bail!("수신 오류: {:?}", e),
         None => anyhow::bail!("연결 종료"),
     };
 
-    let session_key = String::from_utf8(bytes.to_vec())
-        .map_err(|_| anyhow::anyhow!("sessionKey UTF-8 오류"))?;
-    let session_key = session_key.trim_end_matches('\0').to_string();
-    log::info!("[server] sessionKey 수신: {}", session_key);
+    let msg: HandshakeMsg = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("핸드쉐이크 JSON 파싱 실패: {:?}", e))?;
 
-    // activate()로 받은 expected_key와 일치 여부만 확인
-    let valid = session_key == expected_key;
     log::info!(
-        "[server] 검증: {} → {}",
-        session_key,
-        if valid { "OK" } else { "DENY (키 불일치)" }
+        "[server] 핸드쉐이크 수신: sessionKey={} viewerNonce={}",
+        msg.session_key,
+        msg.viewer_nonce
     );
 
+    // 1차 로컬 검증 — sessionKey 일치
+    if msg.session_key != expected_key {
+        log::warn!(
+            "[server] sessionKey 불일치: viewer={}, expected={}",
+            msg.session_key,
+            expected_key
+        );
+        stream
+            .send_bytes(bytes::Bytes::from_static(&[0u8]))
+            .await?;
+        anyhow::bail!("sessionKey 불일치");
+    }
+
+    // 2차 서버 검증 — verify-connect API 호출 → PENDING → RUNNING
+    match crate::api::verify_connect(
+        &msg.session_key,
+        device_key,
+        &msg.connect_token,
+        &msg.viewer_nonce,
+        viewer_ip,
+    )
+    .await
+    {
+        Ok(data) => {
+            log::info!(
+                "[server] verify-connect 성공: sessionId={} status={}",
+                data.session_id,
+                data.status
+            );
+            stream
+                .send_bytes(bytes::Bytes::from_static(&[1u8]))
+                .await?;
+            Ok(msg.session_key)
+        }
+        Err(e) => {
+            log::warn!("[server] verify-connect 실패: {:?}", e);
+            stream
+                .send_bytes(bytes::Bytes::from_static(&[0u8]))
+                .await?;
+            anyhow::bail!("verify-connect 실패: {:?}", e)
+        }
+    }
+}
+
+/// 다이렉트 모드용 핸드쉐이크 — JSON 또는 raw bytes 모두 처리 (백엔드 없음)
+async fn handshake_direct(stream: &mut FramedStream, expected_key: &str) -> Result<String> {
+    let bytes = match stream.next().await {
+        Some(Ok(b)) => b,
+        Some(Err(e)) => anyhow::bail!("수신 오류: {:?}", e),
+        None => anyhow::bail!("연결 종료"),
+    };
+
+    // JSON 파싱 시도 → 실패하면 raw bytes로 처리 (하위 호환)
+    let session_key = if let Ok(msg) = serde_json::from_slice::<HandshakeMsg>(&bytes) {
+        msg.session_key
+    } else {
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| anyhow::anyhow!("sessionKey UTF-8 오류"))?
+            .trim_end_matches('\0')
+            .to_string()
+    };
+
+    log::info!("[server] 다이렉트 핸드쉐이크: sessionKey={}", session_key);
+
+    let valid = session_key == expected_key;
     stream
         .send_bytes(bytes::Bytes::from_static(if valid { &[1u8] } else { &[0u8] }))
         .await?;
@@ -148,6 +227,6 @@ async fn handshake(stream: &mut FramedStream, expected_key: &str) -> Result<Stri
     if valid {
         Ok(session_key)
     } else {
-        anyhow::bail!("세션 키 불일치: viewer={}, expected={}", session_key, expected_key)
+        anyhow::bail!("sessionKey 불일치: viewer={}, expected={}", session_key, expected_key)
     }
 }

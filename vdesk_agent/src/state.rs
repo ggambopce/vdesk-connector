@@ -20,7 +20,7 @@ pub enum AgentState {
     /// 백엔드 등록 완료, 새 세션 폴링 대기 중
     Idle,
     /// activate API 완료, 뷰어 TCP 연결 대기 중
-    Pending { session_key: String },
+    Pending { session_key: String, device_key: String },
     /// 뷰어 연결·핸드쉐이크 완료, 화면 스트리밍 중
     Streaming { session_key: String },
 }
@@ -34,7 +34,7 @@ impl AgentState {
     /// 현재 세션 키 (Pending/Streaming 상태에서만 Some)
     pub fn session_key(&self) -> Option<&str> {
         match self {
-            AgentState::Pending { session_key }
+            AgentState::Pending { session_key, .. }
             | AgentState::Streaming { session_key } => Some(session_key),
             AgentState::Idle => None,
         }

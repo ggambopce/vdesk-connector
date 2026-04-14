@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     let local_box = load_or_create_local_box();
     log::info!("LocalBox: {}", local_box);
 
-    let host_name = get_hostname();
+    let agent_name = get_hostname();
     let os_type = if cfg!(target_os = "windows") {
         "WINDOWS"
     } else if cfg!(target_os = "macos") {
@@ -73,17 +73,23 @@ async fn main() -> Result<()> {
     }
     .to_string();
 
+    let relay_port: u16 = std::env::var("AGENT_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(server::LISTEN_PORT);
+
     // ── 백엔드 등록 ───────────────────────────────────────────────────────────
     let reg_data = api::register(&api::RegisterRequest {
         local_box,
-        host_name,
+        agent_name,
         os_type,
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         relay_ip: local_ip.clone(),
+        relay_port,
     })
     .await?;
     let device_key = reg_data.device_key.clone();
-    log::info!("등록 완료 — deviceKey: {}", device_key);
+    log::info!("등록 완료 — deviceKey: {} agentId: {}", device_key, reg_data.agent_id);
 
     // ── 공유 상태 생성 (백엔드 폴링 ↔ 원격 제어 세션 분리) ───────────────────
     let shared_state = state::new_state();
@@ -105,9 +111,16 @@ async fn main() -> Result<()> {
     loop {
         // heartbeat (세션 상태와 무관하게 주기적으로 전송)
         if last_hb.elapsed() >= hb_interval {
+            let current_session_key = shared_state.lock().unwrap().session_key().map(String::from);
+            let is_idle = shared_state.lock().unwrap().is_idle();
             if let Err(e) = api::heartbeat(&api::HeartbeatRequest {
                 device_key: device_key.clone(),
                 relay_ip: local_ip.clone(),
+                relay_port,
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                agent_status: "ONLINE".to_string(),
+                session_acceptable: is_idle,
+                current_session_key,
             })
             .await
             {
@@ -141,17 +154,13 @@ async fn main() -> Result<()> {
                 };
                 log::info!("[poll] 대기 세션 발견: {}", session_key);
 
-                match api::activate(&api::ActivateRequest {
-                    device_key: device_key.clone(),
-                    session_key: session_key.clone(),
-                })
-                .await
-                {
+                match api::activate(&device_key, &session_key).await {
                     Ok(data) => {
-                        log::info!("[activate] 완료: sessionKey={}", data.session_key);
+                        log::info!("[activate] 완료: sessionKey={} status={}", data.session_key, data.status);
                         // Idle → Pending: 원격 제어 세션이 TCP 연결을 기다림
                         *shared_state.lock().unwrap() = AgentState::Pending {
                             session_key: data.session_key,
+                            device_key: device_key.clone(),
                         };
                     }
                     Err(e) => log::warn!("[activate] 실패: {:?}", e),

@@ -144,66 +144,52 @@ pub struct SessionInfo {
     pub session_id: u64,
     #[serde(rename = "sessionKey")]
     pub session_key: String,
+    #[serde(rename = "connectToken")]
+    pub connect_token: String,
+    #[serde(rename = "relayIp")]
+    pub relay_ip: String,
+    #[serde(rename = "relayPort")]
+    pub relay_port: u16,
     pub status: String,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: Option<String>,
 }
 
 pub fn create_session(client: &ViewerClient, device_id: u64) -> Result<SessionInfo> {
-    let url = format!("{}/api/remote/sessions", base_url());
+    let url = format!("{}/api/remote/session/create", base_url());
     let req = CreateSessionRequest { device_id };
     let resp = client.inner.post(&url).json(&req).send()?;
     extract(resp)
 }
 
-// ─── Relay 정보 조회 (세션이 RUNNING이 될 때까지 폴링) ──────────────────────
+// ─── Viewer heartbeat ─────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Debug, Clone)]
-pub struct RelayInfo {
-    #[serde(rename = "relayIp")]
-    pub relay_ip: String,
-    #[serde(rename = "relayPort")]
-    pub relay_port: u16,
+#[derive(Serialize)]
+struct ViewerHeartbeatRequest<'a> {
     #[serde(rename = "sessionKey")]
-    pub session_key: String,
-    pub status: String,
+    session_key: &'a str,
+    #[serde(rename = "viewerVersion")]
+    viewer_version: &'a str,
 }
 
-pub fn get_relay(client: &ViewerClient, session_key: &str) -> Result<RelayInfo> {
-    let url = format!(
-        "{}/api/agent/sessions/relay?sessionKey={}",
-        base_url(),
-        session_key
-    );
-    let resp = client.inner.get(&url).send()?;
-    extract(resp)
-}
-
-/// RUNNING 상태가 될 때까지 반복 폴링 (최대 60초)
-pub fn wait_for_running(client: &ViewerClient, session_key: &str) -> Result<RelayInfo> {
-    let max_attempts = 60;
-    for attempt in 1..=max_attempts {
-        match get_relay(client, session_key) {
-            Ok(relay) if relay.status == "RUNNING" => return Ok(relay),
-            Ok(relay) => {
-                log::info!(
-                    "[api] 세션 대기 중 ({}/{}): status={}",
-                    attempt,
-                    max_attempts,
-                    relay.status
-                );
-            }
-            Err(e) => {
-                log::debug!("[api] relay 조회 오류: {:?}", e);
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+pub fn viewer_heartbeat(client: &ViewerClient, session_id: u64, session_key: &str) -> Result<()> {
+    let url = format!("{}/api/remote/session/viewer/heartbeat/{}", base_url(), session_id);
+    let req = ViewerHeartbeatRequest {
+        session_key,
+        viewer_version: env!("CARGO_PKG_VERSION"),
+    };
+    let resp = client.inner.post(&url).json(&req).send()?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("Viewer heartbeat failed: {}", status);
     }
-    bail!("세션이 60초 내에 RUNNING 상태가 되지 않았습니다")
+    Ok(())
 }
 
 // ─── 세션 종료 ────────────────────────────────────────────────────────────────
 
 pub fn end_session(client: &ViewerClient, session_id: u64) -> Result<()> {
-    let url = format!("{}/api/remote/sessions/{}/end", base_url(), session_id);
+    let url = format!("{}/api/remote/session/end/{}", base_url(), session_id);
     let resp = client.inner.post(&url).send()?;
     let status = resp.status();
     if !status.is_success() {

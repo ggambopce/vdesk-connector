@@ -33,13 +33,19 @@ const IN_PING:         u8 = 0x06;
 const IN_MOUSE_GLOBAL: u8 = 0x07;
 const IN_KEY_VK:       u8 = 0x08;
 
-pub async fn run(mut stream: FramedStream, session_key: String) -> Result<()> {
+pub async fn run(mut stream: FramedStream, session_key: String, device_key: String) -> Result<()> {
     log::info!("[session] 세션 시작: {}", session_key);
 
     // 비디오 캡처 채널
     let (video_tx, mut video_rx) = mpsc::channel::<VideoFrame>(2);
     // 아웃바운드 제어 메시지 (Pong, CursorShape)
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(16);
+
+    // 세션 heartbeat: 15초 간격으로 서버에 보고
+    let mut hb_tick = tokio::time::interval(std::time::Duration::from_secs(15));
+    hb_tick.tick().await; // 첫 틱 즉시 소모 (시작 직후 호출 방지)
+    let mut bytes_out_total: u64 = 0;
+    let mut bytes_in_total: u64 = 0;
 
     // 커서 폴링: 50ms 간격으로 원격 커서 모양 감지 후 전송
     let mut cursor_tick = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -56,6 +62,9 @@ pub async fn run(mut stream: FramedStream, session_key: String) -> Result<()> {
             }
         }
     });
+
+    let hb_device_key = device_key.clone();
+    let hb_session_key = session_key.clone();
 
     // video_tx 원본 drop — capture task의 clone이 유일한 sender가 됨
     // → capture task가 실패하면 recv()가 None을 반환해 영구 블록 방지
@@ -103,6 +112,19 @@ pub async fn run(mut stream: FramedStream, session_key: String) -> Result<()> {
                         log::warn!("[session] 커서 전송 오류: {:?}", e);
                         break;
                     }
+                }
+            }
+            _ = hb_tick.tick() => {
+                let req = crate::api::SessionHeartbeatRequest {
+                    device_key: hb_device_key.clone(),
+                    session_key: hb_session_key.clone(),
+                    bytes_out: bytes_out_total,
+                    bytes_in: bytes_in_total,
+                };
+                if let Err(e) = crate::api::session_heartbeat(&req).await {
+                    log::warn!("[session] 세션 heartbeat 실패: {:?}", e);
+                } else {
+                    log::debug!("[session] 세션 heartbeat OK (out={}, in={})", bytes_out_total, bytes_in_total);
                 }
             }
         }

@@ -38,6 +38,9 @@ fn main() -> Result<()> {
             .unwrap_or(20020);
         let session_key = std::env::var("VDESK_DIRECT_KEY")
             .unwrap_or_else(|_| "direct".to_string());
+        // 다이렉트 모드에서는 connectToken을 빈 문자열로 (에이전트도 직접 모드라 검증 생략)
+        let connect_token = std::env::var("VDESK_DIRECT_TOKEN")
+            .unwrap_or_else(|_| "direct".to_string());
 
         log::info!("★ 다이렉트 모드 — {}:{} 직접 연결 (키: {})", host, port, session_key);
 
@@ -47,7 +50,7 @@ fn main() -> Result<()> {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                match connection::connect(&host, port, &session_key).await {
+                match connection::connect(&host, port, &session_key, &connect_token).await {
                     Ok(stream) => {
                         log::info!("[main] 에이전트 연결 성공");
                         if let Err(e) = session::run(stream, frame_tx, input_rx).await {
@@ -123,26 +126,32 @@ fn main() -> Result<()> {
         device_id
     };
 
-    // 세션 생성
+    // 세션 생성 — connectToken + relayIp/relayPort 포함
     log::info!("[main] 세션 생성 (device={})", device_id);
     let session_info = api::create_session(&client, device_id)?;
-    log::info!("[main] 세션: {} ({})", session_info.session_key, session_info.status);
+    log::info!(
+        "[main] 세션: {} ({}) relay={}:{}",
+        session_info.session_key,
+        session_info.status,
+        session_info.relay_ip,
+        session_info.relay_port
+    );
 
     let session_id = session_info.session_id;
-
-    // RUNNING 상태 대기
-    log::info!("[main] 에이전트 수락 대기 중...");
-    let relay = api::wait_for_running(&client, &session_info.session_key)?;
-    log::info!("[main] 연결 주소: {}:{}", relay.relay_ip, relay.relay_port);
+    let relay_ip = session_info.relay_ip.clone();
+    let relay_port = session_info.relay_port;
+    let session_key = session_info.session_key.clone();
+    let connect_token = session_info.connect_token.clone();
 
     // 채널 생성
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<display::FrameBuffer>(2);
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<display::InputEvent>();
 
     // 세션 루프 (별도 스레드 + Tokio 런타임)
-    let relay_ip = relay.relay_ip.clone();
-    let relay_port = relay.relay_port;
-    let session_key = relay.session_key.clone();
+    // Viewer heartbeat용 client 공유 — Arc로 감싸서 두 스레드에서 사용
+    let client = std::sync::Arc::new(client);
+    let hb_client = client.clone();
+    let hb_session_key = session_key.clone();
 
     std::thread::spawn(move || {
         // ── async 세션 루프 ──────────────────────────────────────────────────
@@ -151,7 +160,9 @@ fn main() -> Result<()> {
         // 안에서 실행하고 end_session은 block_on 이후에 호출한다.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
-            match connection::connect(&relay_ip, relay_port, &session_key).await {
+            // 에이전트가 아직 poll 전일 수 있으므로 재시도 루프로 연결
+            log::info!("[main] 에이전트 연결 대기 중 (최대 60s)...");
+            match connection::retry_connect(&relay_ip, relay_port, &session_key, &connect_token, 60).await {
                 Ok(stream) => {
                     log::info!("[main] 에이전트 연결 성공");
                     if let Err(e) = session::run(stream, frame_tx, input_rx).await {
@@ -167,6 +178,18 @@ fn main() -> Result<()> {
         drop(rt);
         let _ = api::end_session(&client, session_id);
         log::info!("[main] 세션 종료");
+    });
+
+    // Viewer heartbeat 스레드 — 스트리밍 중 10초마다 서버에 보고
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            if let Err(e) = api::viewer_heartbeat(&hb_client, session_id, &hb_session_key) {
+                log::warn!("[main] viewer heartbeat 실패: {:?}", e);
+            } else {
+                log::debug!("[main] viewer heartbeat OK");
+            }
+        }
     });
 
     // winit 이벤트 루프 (메인 스레드 필수)
