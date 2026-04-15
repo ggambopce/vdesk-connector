@@ -33,6 +33,8 @@ winapi = { version = "0.3", features = [
     "dxgi", "dxgi1_2", "dxgitype", "dxgiformat",
     "d3d11", "d3dcommon",
     "winerror",
+    # GDI BitBlt 폴백 캡처
+    "wingdi",
 ] }
 
 [build-dependencies]

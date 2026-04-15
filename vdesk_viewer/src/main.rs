@@ -146,7 +146,19 @@ fn run_uri_mode(params: UriParams) -> Result<()> {
                         log::error!("[uri] 세션 오류: {:?}", e);
                     }
                 }
-                Err(e) => log::error!("[uri] 연결 실패: {:?}", e),
+                Err(e) => {
+                    log::error!("[uri] 연결 실패: {:?}", e);
+                    // 연결 실패 시 즉시 세션 종료 → 대시보드 poll이 ENDED 감지 가능
+                    // (window.location.href 방식이라 대시보드가 새로고침 안 됐으므로 여기서 정리 필요)
+                    let sk = session_key.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e2) = api::end_session_by_key(&sk) {
+                            log::warn!("[uri] end-by-key 실패 (무시, 스케줄러가 처리): {:?}", e2);
+                        } else {
+                            log::info!("[uri] 연결 실패 후 세션 종료 완료");
+                        }
+                    }).await.ok();
+                }
             }
         });
     });

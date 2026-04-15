@@ -83,15 +83,29 @@ pub async fn listen_loop(state: SharedState) -> Result<()> {
                         log::error!("[session] 세션 오류: {:?}", e);
                     }
 
-                    // 세션 종료를 백엔드에 보고 (idempotent — 이미 ENDED여도 무시)
+                    // 세션 종료를 백엔드에 보고 (최대 3회 재시도, idempotent)
                     let end_req = crate::api::EndRequest {
                         device_key: device_key.clone(),
                         session_key: session_key.clone(),
                     };
-                    if let Err(e) = crate::api::end_session(&end_req).await {
-                        log::warn!("[server] session/end 호출 실패 (무시): {:?}", e);
-                    } else {
-                        log::info!("[server] session/end 보고 완료");
+                    let mut reported = false;
+                    for attempt in 1..=3u8 {
+                        match crate::api::end_session(&end_req).await {
+                            Ok(_) => {
+                                log::info!("[server] session/end 보고 완료 (시도 {})", attempt);
+                                reported = true;
+                                break;
+                            }
+                            Err(e) => {
+                                log::warn!("[server] session/end 시도 {}/3 실패: {:?}", attempt, e);
+                                if attempt < 3 {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                }
+                            }
+                        }
+                    }
+                    if !reported {
+                        log::warn!("[server] session/end 최종 실패 — 스케줄러가 처리");
                     }
 
                     // Streaming → Idle (재폴링 허용)
