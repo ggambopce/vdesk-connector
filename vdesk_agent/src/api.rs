@@ -164,6 +164,9 @@ pub struct SessionHeartbeatRequest {
 #[derive(Deserialize, Debug)]
 pub struct SessionHeartbeatData {
     pub status: String,
+    /// true이면 에이전트는 세션을 즉시 종료해야 함 (백엔드 판정)
+    #[serde(rename = "shouldTerminate", default)]
+    pub should_terminate: bool,
 }
 
 // ─── 백엔드 래퍼 응답 역직렬화 ───────────────────────────────────────────────
@@ -245,14 +248,24 @@ pub async fn verify_connect(
 }
 
 /// 에이전트 세션 heartbeat — 스트리밍 중 주기 호출
-pub async fn session_heartbeat(req: &SessionHeartbeatRequest) -> Result<()> {
+/// 응답의 shouldTerminate가 true이면 세션 루프를 break해야 함
+pub async fn session_heartbeat(req: &SessionHeartbeatRequest) -> Result<SessionHeartbeatData> {
     let url = format!("{}/api/agent/session/heartbeat", base_url());
     let resp = reqwest::Client::new().post(&url).json(req).send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("Session heartbeat failed: {}", status);
-    }
-    Ok(())
+    extract(resp).await
+}
+
+#[derive(Deserialize, Debug)]
+pub struct CheckPendingData {
+    #[serde(rename = "shouldReset", default)]
+    pub should_reset: bool,
+}
+
+/// Pending 상태 유효성 확인 — 세션이 취소됐으면 shouldReset=true
+pub async fn check_pending_session(req: &EndRequest) -> Result<CheckPendingData> {
+    let url = format!("{}/api/agent/session/check-pending", base_url());
+    let resp = reqwest::Client::new().post(&url).json(req).send().await?;
+    extract(resp).await
 }
 
 pub async fn end_session(req: &EndRequest) -> Result<()> {

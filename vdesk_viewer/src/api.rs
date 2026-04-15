@@ -172,18 +172,22 @@ struct ViewerHeartbeatRequest<'a> {
     viewer_version: &'a str,
 }
 
-pub fn viewer_heartbeat(client: &ViewerClient, session_id: u64, session_key: &str) -> Result<()> {
+#[derive(Deserialize, Debug)]
+pub struct ViewerHeartbeatData {
+    pub status: String,
+    /// true이면 뷰어는 세션을 즉시 종료해야 함 (백엔드 판정)
+    #[serde(rename = "shouldTerminate", default)]
+    pub should_terminate: bool,
+}
+
+pub fn viewer_heartbeat(client: &ViewerClient, session_id: u64, session_key: &str) -> Result<ViewerHeartbeatData> {
     let url = format!("{}/api/remote/session/viewer/heartbeat/{}", base_url(), session_id);
     let req = ViewerHeartbeatRequest {
         session_key,
         viewer_version: env!("CARGO_PKG_VERSION"),
     };
     let resp = client.inner.post(&url).json(&req).send()?;
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("Viewer heartbeat failed: {}", status);
-    }
-    Ok(())
+    extract(resp)
 }
 
 // ─── 세션 종료 ────────────────────────────────────────────────────────────────
@@ -194,6 +198,18 @@ pub fn end_session(client: &ViewerClient, session_id: u64) -> Result<()> {
     let status = resp.status();
     if !status.is_success() {
         bail!("End session failed: {}", status);
+    }
+    Ok(())
+}
+
+/// URI 모드 전용 — JWT 없이 sessionKey만으로 세션 종료
+pub fn end_session_by_key(session_key: &str) -> Result<()> {
+    let url = format!("{}/api/remote/session/end-by-key/{}", base_url(), session_key);
+    let client = reqwest::blocking::Client::new();
+    let resp = client.post(&url).send()?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("End session by key failed: {}", status);
     }
     Ok(())
 }

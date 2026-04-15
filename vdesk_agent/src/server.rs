@@ -2,7 +2,7 @@
 //!
 //! AgentState 전환:
 //!   Pending ──[핸드쉐이크 성공]──► Streaming ──[세션 종료]──► Idle
-//!   Pending ──[핸드쉐이크 실패]──► Idle  (재폴링 허용)
+//!   Pending ──[핸드쉐이크 실패]──► Pending 유지 (올바른 뷰어 재시도 허용)
 
 use anyhow::Result;
 use hbb_common::{log, tcp::FramedStream, tokio::net::TcpListener};
@@ -79,8 +79,19 @@ pub async fn listen_loop(state: SharedState) -> Result<()> {
                         session_key: session_key.clone(),
                     };
 
-                    if let Err(e) = crate::session::run(stream, session_key, device_key).await {
+                    if let Err(e) = crate::session::run(stream, session_key.clone(), device_key.clone()).await {
                         log::error!("[session] 세션 오류: {:?}", e);
+                    }
+
+                    // 세션 종료를 백엔드에 보고 (idempotent — 이미 ENDED여도 무시)
+                    let end_req = crate::api::EndRequest {
+                        device_key: device_key.clone(),
+                        session_key: session_key.clone(),
+                    };
+                    if let Err(e) = crate::api::end_session(&end_req).await {
+                        log::warn!("[server] session/end 호출 실패 (무시): {:?}", e);
+                    } else {
+                        log::info!("[server] session/end 보고 완료");
                     }
 
                     // Streaming → Idle (재폴링 허용)
@@ -88,9 +99,8 @@ pub async fn listen_loop(state: SharedState) -> Result<()> {
                     log::info!("[server] 세션 종료 → Idle");
                 }
                 Err(e) => {
-                    log::warn!("[server] 핸드쉐이크 실패 ({}): {:?}", peer_addr, e);
-                    // Pending → Idle (재폴링 허용)
-                    *state_task.lock().unwrap() = AgentState::Idle;
+                    log::warn!("[server] 핸드쉐이크 실패 ({}): {:?} — Pending 유지", peer_addr, e);
+                    // Pending 유지: 올바른 뷰어가 재시도할 수 있도록 Idle로 전환하지 않음
                 }
             }
         });

@@ -131,9 +131,31 @@ async fn main() -> Result<()> {
             last_hb = std::time::Instant::now();
         }
 
-        // Idle 상태일 때만 poll — Pending/Streaming 중에는 건너뜀
+        // Idle 상태일 때만 poll — Streaming 중에는 건너뜀
+        // Pending 중에는 세션 취소 여부를 백엔드에 확인 (사용자가 모달 닫기 시 즉시 감지)
         if !shared_state.lock().unwrap().is_idle() {
-            log::trace!("[poll] 세션 활성 중 — 건너뜀");
+            let pending_info = {
+                let s = shared_state.lock().unwrap();
+                match &*s {
+                    AgentState::Pending { session_key, device_key } => {
+                        Some((session_key.clone(), device_key.clone()))
+                    }
+                    _ => None,
+                }
+            };
+
+            if let Some((session_key, device_key)) = pending_info {
+                let check_req = api::EndRequest { device_key, session_key };
+                match api::check_pending_session(&check_req).await {
+                    Ok(data) if data.should_reset => {
+                        log::info!("[pending] 백엔드 세션 취소 감지 → Idle 복귀");
+                        *shared_state.lock().unwrap() = AgentState::Idle;
+                    }
+                    Ok(_) => log::trace!("[pending] 세션 유효 — 뷰어 대기 중"),
+                    Err(e) => log::warn!("[pending] check-pending 실패 (무시): {:?}", e),
+                }
+            }
+
             tokio::time::sleep(poll_interval).await;
             continue;
         }
@@ -159,9 +181,37 @@ async fn main() -> Result<()> {
                         log::info!("[activate] 완료: sessionKey={} status={}", data.session_key, data.status);
                         // Idle → Pending: 원격 제어 세션이 TCP 연결을 기다림
                         *shared_state.lock().unwrap() = AgentState::Pending {
-                            session_key: data.session_key,
+                            session_key: data.session_key.clone(),
                             device_key: device_key.clone(),
                         };
+
+                        // Pending 타임아웃 감시 태스크 (5분 안에 뷰어 미접속 시 Idle 복귀)
+                        let timeout_state = shared_state.clone();
+                        let timeout_dk = device_key.clone();
+                        let timeout_sk = data.session_key.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(300)).await;
+                            // 락을 블록으로 감싸 MutexGuard가 await 전에 반드시 해제되도록 함
+                            let timed_out = {
+                                let mut state = timeout_state.lock().unwrap();
+                                if matches!(*state, AgentState::Pending { .. }) {
+                                    log::warn!("[pending] 5분 타임아웃 — Idle 전환 + session/end 보고");
+                                    *state = AgentState::Idle;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }; // MutexGuard 해제
+                            if timed_out {
+                                let end_req = api::EndRequest {
+                                    device_key: timeout_dk,
+                                    session_key: timeout_sk,
+                                };
+                                if let Err(e) = api::end_session(&end_req).await {
+                                    log::warn!("[pending] session/end 실패 (무시): {:?}", e);
+                                }
+                            }
+                        });
                     }
                     Err(e) => log::warn!("[activate] 실패: {:?}", e),
                 }

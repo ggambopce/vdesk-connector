@@ -84,24 +84,34 @@ New-NetFirewallRule -DisplayName "VDesk Agent" -Direction Inbound -Protocol TCP 
 
 ```
 Idle ──[activate]──► Pending ──[handshake OK]──► Streaming ──[session end]──► Idle
-                              └─[handshake fail]──────────────────────────────► Idle
+                              └─[handshake fail]──► Pending (stays, allows viewer retry)
 ```
 
 - Poll/heartbeat only runs when `Idle`
 - `listen_loop` only accepts connections when `Pending`
+- Handshake failure keeps agent in `Pending` — the viewer retries with the same or correct credentials
 - `listen_loop_direct` runs sessions inline (no spawn) so the accept loop blocks until the current session fully terminates — this prevents DXGI handle conflicts on reconnect
 
 ### Session Flow (backend mode)
 
 ```
-Agent → POST /api/host/register           → deviceKey
-Agent → POST /api/host/heartbeat          (15s loop)
-Agent → POST /api/agent/sessions/poll     (3s loop)
-Viewer → POST /api/remote/sessions        → sessionKey
-Agent poll → POST /api/agent/sessions/activate → RUNNING
-Viewer → GET /api/agent/sessions/relay    → relayIp:20020
-Viewer → TCP connect → handshake → stream
+Agent → POST /api/agent/register          → deviceKey  (persists localBox in %TEMP%\vdesk_agent_id)
+Agent → POST /api/agent/heartbeat         (15s loop)
+Agent → POST /api/agent/session/poll      (3s loop, single path)
+Browser → POST /api/remote/session/create → {sessionKey, connectToken, relayIp, relayPort}
+Agent poll → POST /api/agent/session/activate/{sessionKey} → status=PENDING
+User clicks "뷰어 실행하기" → vdesk_viewer.exe launched via vdesk:// URI
+Viewer → TCP connect to relayIp:20020
+Viewer → JSON handshake {sessionKey, connectToken, viewerNonce}
+Agent → POST /api/agent/sessions/verify-connect/{sessionKey} → status=RUNNING
+Browser poll detects RUNNING, heartbeat loop starts
 ```
+
+**TCP handshake format** (viewer → agent, sent as FramedStream bytes):
+```json
+{"sessionKey":"...","connectToken":"ct_...","viewerNonce":"nonce-uuid"}
+```
+Agent responds: `0x01` = OK (proceed to stream), `0x00` = rejected.
 
 ### Video Pipeline (agent)
 

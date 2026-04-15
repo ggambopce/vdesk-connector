@@ -121,10 +121,15 @@ pub async fn run(mut stream: FramedStream, session_key: String, device_key: Stri
                     bytes_out: bytes_out_total,
                     bytes_in: bytes_in_total,
                 };
-                if let Err(e) = crate::api::session_heartbeat(&req).await {
-                    log::warn!("[session] 세션 heartbeat 실패: {:?}", e);
-                } else {
-                    log::debug!("[session] 세션 heartbeat OK (out={}, in={})", bytes_out_total, bytes_in_total);
+                match crate::api::session_heartbeat(&req).await {
+                    Ok(data) => {
+                        log::debug!("[session] 세션 heartbeat OK (out={}, in={})", bytes_out_total, bytes_in_total);
+                        if data.should_terminate {
+                            log::info!("[session] 백엔드 종료 지시 수신 (status={}) → 세션 종료", data.status);
+                            break;
+                        }
+                    }
+                    Err(e) => log::warn!("[session] 세션 heartbeat 실패: {:?}", e),
                 }
             }
         }
