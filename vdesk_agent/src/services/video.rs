@@ -143,11 +143,12 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
         }
     };
 
-    let mut i420_buf: Vec<u8> = Vec::new();
-    let mut last_hash: u64    = 0;
-    let mut frames: u64       = 0;
-    let mut drop_count: u32   = 0;
-    let mut last_tick         = Instant::now();
+    let mut i420_buf: Vec<u8>      = Vec::new();
+    let mut last_hash: u64         = 0;
+    let mut frames: u64            = 0;
+    let mut drop_count: u32        = 0;
+    let mut force_keyframe_on_next = false; // 채널 드롭 발생 시 다음 프레임을 키프레임으로 강제
+    let mut last_tick              = Instant::now();
 
     loop {
         if tx.is_closed() {
@@ -190,7 +191,8 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
         //     해시 샘플링이 작은 변경을 놓칠 수 있으므로 스킵 금지.
         // - is_full_frame=true + has_dirty_rects=true(dirty 면적 >= 50%):
         //     화면 절반 이상 변경 → 해시가 변화를 감지할 확률이 높아 스킵 적용.
-        let force_key = frames % (TARGET_FPS * 3) == 0;
+        let force_key = force_keyframe_on_next || frames % (TARGET_FPS * 10) == 0;
+        force_keyframe_on_next = false;
         if frame.is_full_frame {
             let hash = fnv_sample(frame.bgra);
             let is_static = hash == last_hash;
@@ -238,8 +240,9 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
             Ok(_) => { drop_count = 0; }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 drop_count += 1;
+                force_keyframe_on_next = true; // 드롭 후 다음 프레임은 키프레임으로 강제
                 if drop_count % 10 == 0 {
-                    log::debug!("[video] 채널 포화 드롭 {}회", drop_count);
+                    log::warn!("[video] 채널 포화 드롭 {}회 — 다음 프레임 키프레임 강제", drop_count);
                 }
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,

@@ -103,8 +103,8 @@ async fn main() -> Result<()> {
     });
 
     // ── 백엔드 폴링 담당: heartbeat + poll 루프 ───────────────────────────────
-    let hb_interval = Duration::from_secs(15);
-    let poll_interval = Duration::from_secs(3);
+    let hb_interval = Duration::from_secs(10);  // 15s→10s: 비정상 종료 감지 단축
+    let poll_interval = Duration::from_secs(1); // 3s→1s: 연결 버튼 클릭 후 피드백 즉각화
     let mut last_hb = std::time::Instant::now();
 
     log::info!("백엔드 폴링 루프 시작");

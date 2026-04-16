@@ -57,7 +57,7 @@ VpxEncHandle* vpx_enc_create_ex(int w, int h, int bitrate_kbps, int fps, int *ou
 
     handle->cfg.g_w                = (unsigned)w;
     handle->cfg.g_h                = (unsigned)h;
-    handle->cfg.g_threads          = 2;
+    handle->cfg.g_threads          = 4;               /* 2→4: 멀티코어 활용 */
     handle->cfg.g_lag_in_frames    = 0;
     handle->cfg.g_error_resilient  = 1;
     handle->cfg.rc_end_usage       = VPX_CBR;
@@ -66,15 +66,15 @@ VpxEncHandle* vpx_enc_create_ex(int w, int h, int bitrate_kbps, int fps, int *ou
     handle->cfg.rc_max_quantizer   = 48;
     handle->cfg.rc_undershoot_pct  = 95;
     handle->cfg.rc_overshoot_pct   = 5;
-    handle->cfg.rc_buf_sz          = 1000;
-    handle->cfg.rc_buf_initial_sz  = 500;
-    handle->cfg.rc_buf_optimal_sz  = 600;
+    handle->cfg.rc_buf_sz          = 500;             /* 1000→500: 버스트 반응성 향상 */
+    handle->cfg.rc_buf_initial_sz  = 200;
+    handle->cfg.rc_buf_optimal_sz  = 350;
     handle->cfg.g_timebase.num     = 1;
     handle->cfg.g_timebase.den     = fps;
     handle->cfg.kf_mode            = VPX_KF_AUTO;
     /* VPX_KF_AUTO에서는 kf_min_dist가 지원되지 않음(0만 허용). */
     handle->cfg.kf_min_dist        = 0;
-    handle->cfg.kf_max_dist        = (unsigned)(fps * 3);
+    handle->cfg.kf_max_dist        = (unsigned)(fps * 10); /* 3s→10s: 불필요 키프레임 감소 */
 
     if (vpx_codec_enc_init(&handle->ctx, iface, &handle->cfg, 0) != VPX_CODEC_OK) {
         set_last_err(&handle->ctx, "vpx_codec_enc_init");
@@ -83,7 +83,7 @@ VpxEncHandle* vpx_enc_create_ex(int w, int h, int bitrate_kbps, int fps, int *ou
         return NULL;
     }
 
-    vpx_codec_control(&handle->ctx, VP8E_SET_CPUUSED, 5);
+    vpx_codec_control(&handle->ctx, VP8E_SET_CPUUSED, 8); /* 5→8: 실시간 화면 공유 최적값, 인코딩 속도 +40% */
     vpx_codec_control(&handle->ctx, VP9E_SET_ROW_MT, 1);
     vpx_codec_control(&handle->ctx, VP9E_SET_TILE_COLUMNS, 1);
     vpx_codec_control(&handle->ctx, VP9E_SET_AQ_MODE, 3);

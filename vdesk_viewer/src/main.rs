@@ -147,7 +147,7 @@ fn run_uri_mode(params: UriParams) -> Result<()> {
             // 연결 확립 전 10초 대기 (PENDING 구간에는 alive=true이므로 오작동 없음)
             std::thread::sleep(std::time::Duration::from_secs(10));
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                std::thread::sleep(std::time::Duration::from_secs(3)); // 5s→3s: 종료 감지 단축
                 match api::check_alive(&sk) {
                     Ok(true)  => { /* 정상 — 계속 */ }
                     Ok(false) => {

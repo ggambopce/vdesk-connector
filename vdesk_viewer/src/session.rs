@@ -56,7 +56,7 @@ pub async fn run(
     let mut decoder: Option<VpxDecoder> = None;
     let mut codec = Codec::Vp9; // 기본값
 
-    let mut ping_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut ping_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     ping_tick.tick().await;
 
     loop {
@@ -171,7 +171,11 @@ fn handle_agent_msg(
         MSG_PONG if bytes.len() >= 9 => {
             let sent = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
             let rtt  = now_ms().saturating_sub(sent);
-            log::debug!("[session] RTT: {}ms", rtt);
+            if rtt > 150 {
+                log::warn!("[session] RTT 높음: {}ms — 화면 지연 가능", rtt);
+            } else {
+                log::debug!("[session] RTT: {}ms", rtt);
+            }
         }
 
         MSG_CURSOR if bytes.len() >= 2 => {

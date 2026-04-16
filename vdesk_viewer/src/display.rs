@@ -93,6 +93,10 @@ struct ViewerApp {
     /// 제어 모드에서 커서가 창 가장자리에 있는지 여부
     /// true면 grab 해제 상태 — 에이전트 마우스 전달 중단, OS 리사이즈 허용
     at_edge: bool,
+
+    /// Fit-to-window 모드: true면 프레임을 창 크기에 맞게 축소/확대 렌더링
+    /// false면 1:1 픽셀 + 스크롤. F 키로 토글.
+    fit_to_window: bool,
 }
 
 impl ApplicationHandler<ViewerEvent> for ViewerApp {
@@ -288,6 +292,18 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     return;
                 }
 
+                // F: Fit-to-window 토글 — 비제어 모드에서만 로컬 처리
+                if code == KeyCode::KeyF && state == ElementState::Pressed && !self.control_active {
+                    self.fit_to_window = !self.fit_to_window;
+                    // 1:1 모드로 전환 시 스크롤 오프셋 초기화
+                    if !self.fit_to_window {
+                        self.scroll_x = 0;
+                        self.scroll_y = 0;
+                    }
+                    if let Some(w) = &self.window { w.request_redraw(); }
+                    return;
+                }
+
                 // 나머지 키: 제어 모드 활성 시에만 에이전트로 전달
                 if self.control_active {
                     if let Some(tx) = &self.input_tx {
@@ -370,14 +386,27 @@ impl ViewerApp {
                 }
             }
         }
-        // 원격 PC 모드: 창 좌표 + 스크롤 오프셋 = 프레임 실제 좌표
-        // 에이전트는 (fx, fy, frame_w, frame_h)로 screen 좌표를 계산:
-        //   screen_x = fx * screen_w / frame_w
-        // frame_w == screen_w 이므로 screen_x = fx = x + scroll_x (정확)
+        // 원격 PC 모드: 창 좌표 → 프레임 실제 좌표 변환
         let frame_w = self.current_frame.as_ref().map_or(self.window_size.0, |f| f.width);
         let frame_h = self.current_frame.as_ref().map_or(self.window_size.1, |f| f.height);
-        let fx = (x + self.scroll_x as i32).clamp(0, frame_w as i32 - 1);
-        let fy = (y + self.scroll_y as i32).clamp(0, frame_h as i32 - 1);
+        let (win_w, win_h) = self.window_size;
+
+        let (fx, fy) = if self.fit_to_window && frame_w > 0 && frame_h > 0
+            && (frame_w != win_w || frame_h != win_h)
+        {
+            // Fit 모드: 창 좌표를 스케일 비율로 프레임 좌표로 변환
+            let fx = (x as i64 * frame_w as i64 / win_w.max(1) as i64)
+                .clamp(0, frame_w as i64 - 1) as i32;
+            let fy = (y as i64 * frame_h as i64 / win_h.max(1) as i64)
+                .clamp(0, frame_h as i64 - 1) as i32;
+            (fx, fy)
+        } else {
+            // 1:1 모드: 스크롤 오프셋 적용
+            let fx = (x + self.scroll_x as i32).clamp(0, frame_w as i32 - 1);
+            let fy = (y + self.scroll_y as i32).clamp(0, frame_h as i32 - 1);
+            (fx, fy)
+        };
+
         let _ = tx.send(InputEvent::MouseMove {
             x:     fx,
             y:     fy,
@@ -533,32 +562,35 @@ impl ViewerApp {
             }
         }
 
-        // 스크롤 범위 클램프 (창 크기/프레임 크기 변동 대응)
-        let max_sx = frame.width.saturating_sub(win_w);
-        let max_sy = frame.height.saturating_sub(win_h);
-        self.scroll_x = self.scroll_x.min(max_sx);
-        self.scroll_y = self.scroll_y.min(max_sy);
-
-        // 프레임이 창보다 작을 때 중앙 정렬 오프셋
-        let off_x = if frame.width  < win_w { (win_w - frame.width)  / 2 } else { 0 };
-        let off_y = if frame.height < win_h { (win_h - frame.height) / 2 } else { 0 };
-
         if let Ok(mut buf) = surface.buffer_mut() {
-            // 1:1 픽셀 복사 (스케일링 없음) — 창보다 큰 영역은 스크롤로 패닝
-            blit_frame(
-                &frame.pixels, frame.width, frame.height,
-                &mut buf,      win_w,       win_h,
-                self.scroll_x, self.scroll_y,
-                off_x,         off_y,
-            );
+            if self.fit_to_window && (frame.width != win_w || frame.height != win_h) {
+                // Fit-to-window: Nearest-neighbor 스케일링
+                blit_frame_scaled(&frame.pixels, frame.width, frame.height, &mut buf, win_w, win_h);
+            } else {
+                // 1:1 픽셀 모드: 스크롤 오프셋 클램프 후 복사
+                let max_sx = frame.width.saturating_sub(win_w);
+                let max_sy = frame.height.saturating_sub(win_h);
+                self.scroll_x = self.scroll_x.min(max_sx);
+                self.scroll_y = self.scroll_y.min(max_sy);
 
-            // 스크롤바 표시 (스크롤이 필요한 경우)
-            if frame.width > win_w || frame.height > win_h {
-                draw_scrollbars(
-                    &mut buf, win_w, win_h,
-                    frame.width, frame.height,
+                let off_x = if frame.width  < win_w { (win_w - frame.width)  / 2 } else { 0 };
+                let off_y = if frame.height < win_h { (win_h - frame.height) / 2 } else { 0 };
+
+                blit_frame(
+                    &frame.pixels, frame.width, frame.height,
+                    &mut buf,      win_w,       win_h,
                     self.scroll_x, self.scroll_y,
+                    off_x,         off_y,
                 );
+
+                // 스크롤바 표시 (스크롤이 필요한 경우)
+                if frame.width > win_w || frame.height > win_h {
+                    draw_scrollbars(
+                        &mut buf, win_w, win_h,
+                        frame.width, frame.height,
+                        self.scroll_x, self.scroll_y,
+                    );
+                }
             }
 
             // 원격 제어 모드 활성 시 녹색 테두리 오버레이
@@ -567,6 +599,27 @@ impl ViewerApp {
             }
 
             let _ = buf.present();
+        }
+    }
+}
+
+/// Fit-to-window 스케일링 렌더링 (Nearest-neighbor)
+///
+/// 프레임을 창 크기에 맞게 비율 유지 없이 채움.
+/// 원격 제어 시 마우스 좌표는 send_pointer_move에서 역변환됨.
+fn blit_frame_scaled(
+    src: &[u32], src_w: u32, src_h: u32,
+    dst: &mut [u32], dst_w: u32, dst_h: u32,
+) {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 { return; }
+    let dst_w_us = dst_w as usize;
+    for dy in 0..dst_h {
+        let sy = (dy as u64 * src_h as u64 / dst_h as u64) as usize;
+        let dst_row = &mut dst[dy as usize * dst_w_us..(dy as usize + 1) * dst_w_us];
+        let src_row_start = sy * src_w as usize;
+        for dx in 0..dst_w_us {
+            let sx = (dx as u64 * src_w as u64 / dst_w as u64) as usize;
+            dst_row[dx] = src[src_row_start + sx];
         }
     }
 }
@@ -912,6 +965,7 @@ pub fn run_event_loop(
         scroll_y:        0,
         mouse_btns:      0,
         at_edge:         false,
+        fit_to_window:   true,
     };
 
     // Wait: 프레임/입력 이벤트가 있을 때만 루프 실행
