@@ -339,7 +339,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: ViewerEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: ViewerEvent) {
         match event {
             ViewerEvent::Frame(f) => {
                 self.current_frame = Some(f);
@@ -347,7 +347,11 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     w.request_redraw();
                 }
             }
-            ViewerEvent::Close => {}
+            // 세션 종료 신호 (TCP 끊김 또는 alive 폴링 감지) → 창 닫기
+            ViewerEvent::Close => {
+                hbb_common::log::info!("[display] Close 이벤트 수신 → 이벤트 루프 종료");
+                event_loop.exit();
+            }
         }
     }
 }
@@ -882,12 +886,15 @@ pub fn run_event_loop(
     let proxy = event_loop.create_proxy();
 
     // 프레임 채널 → 이벤트 루프 전달 스레드
+    // frame_rx가 닫히면(세션 종료/TCP 끊김) Close 이벤트를 보내 창을 닫는다
     std::thread::spawn(move || {
         while let Ok(frame) = frame_rx.recv() {
             if proxy.send_event(ViewerEvent::Frame(frame)).is_err() {
                 break;
             }
         }
+        hbb_common::log::info!("[display] 프레임 채널 종료 → Close 이벤트 전송");
+        let _ = proxy.send_event(ViewerEvent::Close);
     });
 
     let mut app = ViewerApp {

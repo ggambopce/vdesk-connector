@@ -40,6 +40,7 @@ struct UriParams {
     connect_token: String,
     relay_ip:      String,
     relay_port:    u16,
+    session_id:    u64,
 }
 
 /// vdesk://connect?sessionKey=...&connectToken=...&relayIp=...&relayPort=... 파싱
@@ -51,6 +52,7 @@ fn parse_uri(uri: &str) -> Result<UriParams> {
     let mut connect_token = String::new();
     let mut relay_ip      = String::new();
     let mut relay_port: u16 = 20020;
+    let mut session_id: u64 = 0;
 
     for pair in query.trim_end_matches('/').split('&') {
         let mut kv  = pair.splitn(2, '=');
@@ -63,6 +65,7 @@ fn parse_uri(uri: &str) -> Result<UriParams> {
             "connectToken" => connect_token = val,
             "relayIp"      => relay_ip      = val,
             "relayPort"    => relay_port    = val.parse().unwrap_or(20020),
+            "sessionId"    => session_id    = val.parse().unwrap_or(0),
             _ => {}
         }
     }
@@ -74,7 +77,7 @@ fn parse_uri(uri: &str) -> Result<UriParams> {
         anyhow::bail!("URI 파라미터 누락: relayIp");
     }
 
-    Ok(UriParams { session_key, connect_token, relay_ip, relay_port })
+    Ok(UriParams { session_key, connect_token, relay_ip, relay_port, session_id })
 }
 
 // ── Windows vdesk:// URI 스킴 레지스트리 등록 ────────────────────────────────
@@ -134,6 +137,49 @@ fn run_uri_mode(params: UriParams) -> Result<()> {
 
     // 창 닫기 후 세션 종료에 쓸 복사본 (session_key는 스레드로 이동됨)
     let session_key_for_end = session_key.clone();
+
+    // ── alive 폴 스레드 ──────────────────────────────────────────────────────
+    // 대시보드에서 "뷰어 닫기"를 누르면 세션이 ENDED → alive=false → 프로세스 종료
+    // 에이전트 heartbeat(15s)를 기다리지 않고 5초 이내에 창을 닫는다
+    {
+        let sk = session_key.clone();
+        std::thread::spawn(move || {
+            // 연결 확립 전 10초 대기 (PENDING 구간에는 alive=true이므로 오작동 없음)
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                match api::check_alive(&sk) {
+                    Ok(true)  => { /* 정상 — 계속 */ }
+                    Ok(false) => {
+                        log::info!("[uri] alive=false 감지 → 뷰어 종료");
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        log::warn!("[uri] alive 폴링 실패 (무시): {:?}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    // ── viewer heartbeat 스레드 ───────────────────────────────────────────────
+    // SessionTimeoutScheduler가 lastViewerSeenAt > 30s인 RUNNING 세션을 TIMEOUT 처리함.
+    // URI 모드에서 JWT 없이 heartbeat를 보내 세션이 30초 만에 끊기지 않도록 함.
+    if params.session_id > 0 {
+        let (sk, sid) = (session_key.clone(), params.session_id);
+        std::thread::spawn(move || {
+            // 연결 확립 후 8초 대기 (PENDING→RUNNING 전환 대기)
+            std::thread::sleep(std::time::Duration::from_secs(8));
+            loop {
+                if let Err(e) = api::viewer_heartbeat_uri(sid, &sk) {
+                    log::warn!("[uri] viewer heartbeat 실패 (무시): {:?}", e);
+                } else {
+                    log::debug!("[uri] viewer heartbeat 전송 완료");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+        });
+    }
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();

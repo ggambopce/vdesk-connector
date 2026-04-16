@@ -96,11 +96,25 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
 
     timer::begin();
 
-    // DXGI 캡처 초기화
-    let mut capture = DxgiCapture::new().map_err(|e| {
-        log::error!("[video] DXGI 초기화 실패: {:?}", e);
-        e
-    })?;
+    // DXGI 캡처 초기화 (재연결 시 이전 핸들 해제 or 디스플레이 전환 대기를 위해 재시도)
+    let mut capture = {
+        let mut cap = None;
+        for attempt in 1..=10u8 {
+            match DxgiCapture::new() {
+                Ok(c) => { cap = Some(c); break; }
+                Err(e) => {
+                    if attempt < 10 {
+                        log::warn!("[video] DXGI 초기화 실패 (시도 {}/10): {:?} — {}ms 후 재시도", attempt, e, attempt as u64 * 300);
+                        std::thread::sleep(Duration::from_millis(attempt as u64 * 300));
+                    } else {
+                        log::error!("[video] DXGI 초기화 실패 (최종): {:?}", e);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        cap.unwrap()
+    };
 
     let w = capture.width;
     let h = capture.height;

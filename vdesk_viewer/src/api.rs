@@ -202,6 +202,49 @@ pub fn end_session(client: &ViewerClient, session_id: u64) -> Result<()> {
     Ok(())
 }
 
+/// URI 모드 전용 — viewer heartbeat (JWT 없이 sessionKey + sessionId로 호출)
+/// SessionTimeoutScheduler가 lastViewerSeenAt을 30초마다 확인하므로 10초 간격 호출 필요
+pub fn viewer_heartbeat_uri(session_id: u64, session_key: &str) -> Result<ViewerHeartbeatData> {
+    let url = format!("{}/api/remote/session/viewer/heartbeat/{}", base_url(), session_id);
+    let client = reqwest::blocking::Client::builder()
+        .cookie_store(true) // AT 쿠키 없어도 동작하지만 쿠키 jar 유지
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    #[derive(serde::Serialize)]
+    struct HbReq<'a> {
+        #[serde(rename = "sessionKey")]
+        session_key: &'a str,
+        #[serde(rename = "viewerVersion")]
+        viewer_version: &'a str,
+    }
+    let req = HbReq { session_key, viewer_version: env!("CARGO_PKG_VERSION") };
+    let resp = client.post(&url).json(&req).send()?;
+    let status = resp.status();
+    let body: ApiResponse<ViewerHeartbeatData> = resp.json()?;
+    if body.code.unwrap_or(200) != 200 {
+        anyhow::bail!("viewer heartbeat error ({}): {:?}", status, body.message);
+    }
+    body.result
+        .ok_or_else(|| anyhow::anyhow!("viewer heartbeat no result ({})", status))
+}
+
+/// URI 모드 전용 — 세션 활성 여부 확인 (alive 폴링용, JWT 불필요)
+/// RUNNING 또는 PENDING이면 true, 그 외(ENDED/TIMEOUT 등)면 false
+pub fn check_alive(session_key: &str) -> Result<bool> {
+    let url = format!("{}/api/remote/session/alive/{}", base_url(), session_key);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let resp = client.get(&url).send()?;
+    if !resp.status().is_success() {
+        return Ok(false);
+    }
+    #[derive(serde::Deserialize)]
+    struct AliveResult { alive: bool }
+    let body: ApiResponse<AliveResult> = resp.json()?;
+    Ok(body.result.map(|r| r.alive).unwrap_or(false))
+}
+
 /// URI 모드 전용 — JWT 없이 sessionKey만으로 세션 종료
 pub fn end_session_by_key(session_key: &str) -> Result<()> {
     let url = format!("{}/api/remote/session/end-by-key/{}", base_url(), session_key);

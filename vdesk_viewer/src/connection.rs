@@ -94,12 +94,7 @@ pub async fn retry_connect(
     }
 }
 
-/// UUID v4 스타일의 nonce 생성 (uuid 크레이트 없이 직접 구현)
+/// UUID v4 기반 nonce 생성 (128-bit 엔트로피, 재전송 공격 방지)
 fn generate_nonce() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    format!("nonce-{:08x}-{:08x}", seed, seed.wrapping_mul(0x9e3779b9))
+    uuid::Uuid::new_v4().to_string()
 }
