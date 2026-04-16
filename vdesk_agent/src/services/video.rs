@@ -97,17 +97,28 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
     timer::begin();
 
     // DXGI 캡처 초기화 (재연결 시 이전 핸들 해제 or 디스플레이 전환 대기를 위해 재시도)
+    // 0x8000FFFF(E_UNEXPECTED): GPU 드라이버가 이전 세션 핸들을 아직 해제 중인 경우 발생.
+    // session.rs에서 1500ms 대기 후 진입하지만 드라이버가 느릴 수 있으므로 최대 20회 재시도.
     let mut capture = {
+        const MAX_ATTEMPTS: u8 = 20;
+        const RETRY_INTERVAL_MS: u64 = 500;
         let mut cap = None;
-        for attempt in 1..=10u8 {
+        for attempt in 1..=MAX_ATTEMPTS {
             match DxgiCapture::new() {
-                Ok(c) => { cap = Some(c); break; }
+                Ok(c) => {
+                    if attempt > 1 {
+                        log::info!("[video] DXGI 초기화 성공 (시도 {}/{})", attempt, MAX_ATTEMPTS);
+                    }
+                    cap = Some(c);
+                    break;
+                }
                 Err(e) => {
-                    if attempt < 10 {
-                        log::warn!("[video] DXGI 초기화 실패 (시도 {}/10): {:?} — {}ms 후 재시도", attempt, e, attempt as u64 * 300);
-                        std::thread::sleep(Duration::from_millis(attempt as u64 * 300));
+                    if attempt < MAX_ATTEMPTS {
+                        log::warn!("[video] DXGI 초기화 실패 (시도 {}/{}): {:?} — {}ms 후 재시도",
+                            attempt, MAX_ATTEMPTS, e, RETRY_INTERVAL_MS);
+                        std::thread::sleep(Duration::from_millis(RETRY_INTERVAL_MS));
                     } else {
-                        log::error!("[video] DXGI 초기화 실패 (최종): {:?}", e);
+                        log::error!("[video] DXGI 초기화 실패 (최종, {}회 시도): {:?}", MAX_ATTEMPTS, e);
                         return Err(e);
                     }
                 }

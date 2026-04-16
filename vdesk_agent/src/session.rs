@@ -141,6 +141,12 @@ pub async fn run(mut stream: FramedStream, session_key: String, device_key: Stri
     let _ = capture_handle.await;
     log::info!("[session] 캡처 루프 종료 확인 — DXGI 핸들 해제됨");
 
+    // Windows GPU 드라이버는 IDXGIOutputDuplication::Release() 후에도 비동기로 정리를 진행함.
+    // 즉시 재연결 시 DuplicateOutput이 0x8000FFFF(E_UNEXPECTED)를 반환하는 원인.
+    // 이 딜레이로 다음 세션의 server.rs 수락을 지연시켜 드라이버 정리 시간을 확보.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    log::info!("[session] DXGI GPU 드라이버 정리 대기 완료 (1500ms)");
+
     log::info!("[session] 세션 종료: {}", session_key);
     Ok(())
 }
