@@ -24,16 +24,92 @@ mod state;
 use anyhow::Result;
 use hbb_common::log;
 use state::AgentState;
-use std::{net::UdpSocket, time::Duration};
+use std::{
+    fs::{self, OpenOptions},
+    io::{BufWriter, Write},
+    net::UdpSocket,
+    sync::Mutex,
+    time::Duration,
+};
 use uuid::Uuid;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// ── DualLogger: stderr + 파일 동시 출력 ──────────────────────────────────────
+
+struct DualLogger {
+    stderr: env_logger::Logger,
+    file: Mutex<BufWriter<std::fs::File>>,
+}
+
+impl log::Log for DualLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        self.stderr.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.stderr.matches(record) {
+            return;
+        }
+        // stderr (콘솔이 있을 때만 보임)
+        self.stderr.log(record);
+
+        // 파일 (항상 기록)
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let line = format!("[{}] {:5} {}\n", now, record.level(), record.args());
+        if let Ok(mut w) = self.file.lock() {
+            let _ = w.write_all(line.as_bytes());
+            let _ = w.flush();
+        }
+    }
+
+    fn flush(&self) {
+        if let Ok(mut w) = self.file.lock() {
+            let _ = w.flush();
+        }
+    }
+}
+
+fn init_logger() {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
-    env_logger::init();
-    log::info!("VDesk Agent 시작");
+
+    // 로그 디렉터리: exe 위치\logs\vdesk_agent.log
+    let log_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("logs")))
+        .unwrap_or_else(|| std::path::PathBuf::from("logs"));
+
+    let _ = fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("vdesk_agent.log");
+
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path);
+
+    match file {
+        Ok(f) => {
+            let stderr = env_logger::Builder::from_default_env().build();
+            let max_level = stderr.filter();
+            let logger = DualLogger {
+                stderr,
+                file: Mutex::new(BufWriter::new(f)),
+            };
+            log::set_boxed_logger(Box::new(logger)).ok();
+            log::set_max_level(max_level);
+        }
+        Err(e) => {
+            // 파일 열기 실패 시 stderr만 사용
+            env_logger::init();
+            log::warn!("로그 파일 열기 실패 ({:?}): {}", log_path, e);
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_logger();
+    log::info!("VDesk Agent 시작 (API: {})", api::base_url());
 
     // ── 다이렉트 모드: 백엔드 없이 뷰어와 직접 연결 ─────────────────────────
     if std::env::var("VDESK_DIRECT").map_or(false, |v| v == "1") {
@@ -103,8 +179,9 @@ async fn main() -> Result<()> {
     });
 
     // ── 백엔드 폴링 담당: heartbeat + poll 루프 ───────────────────────────────
-    let hb_interval = Duration::from_secs(10);  // 15s→10s: 비정상 종료 감지 단축
-    let poll_interval = Duration::from_secs(1); // 3s→1s: 연결 버튼 클릭 후 피드백 즉각화
+    let hb_interval   = Duration::from_secs(10); // 비정상 종료 감지: 10s
+    let poll_idle     = Duration::from_secs(3);  // Idle: 3s — ngrok free 40req/min 이내 (20/min)
+    let poll_pending  = Duration::from_secs(1);  // Pending: 1s — 세션 취소 즉시 감지
     let mut last_hb = std::time::Instant::now();
 
     log::info!("백엔드 폴링 루프 시작");
@@ -156,7 +233,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            tokio::time::sleep(poll_interval).await;
+            tokio::time::sleep(poll_pending).await;
             continue;
         }
 
@@ -170,7 +247,7 @@ async fn main() -> Result<()> {
                     Some(k) => k,
                     None => {
                         log::warn!("[poll] pending인데 sessionKey 없음");
-                        tokio::time::sleep(poll_interval).await;
+                        tokio::time::sleep(poll_idle).await;
                         continue;
                     }
                 };
@@ -220,7 +297,7 @@ async fn main() -> Result<()> {
             Err(e) => log::warn!("[poll] 오류: {:?}", e),
         }
 
-        tokio::time::sleep(poll_interval).await;
+        tokio::time::sleep(poll_idle).await;
     }
 }
 

@@ -4,9 +4,10 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-/// 백엔드 서버 기본 URL (환경 변수 또는 기본값)
+/// 백엔드 서버 기본 URL
+/// 우선순위: 런타임 VDESK_API_URL 환경변수 → 빌드 시 고정값 (build.rs에서 주입)
 pub fn base_url() -> String {
-    std::env::var("VDESK_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string())
+    std::env::var("VDESK_API_URL").unwrap_or_else(|_| env!("VDESK_API_URL").to_string())
 }
 
 // ─── 요청/응답 타입 ───────────────────────────────────────────────────────────

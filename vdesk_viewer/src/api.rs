@@ -5,8 +5,10 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
+/// 백엔드 서버 기본 URL
+/// 우선순위: 런타임 VDESK_API_URL 환경변수 → 빌드 시 고정값 (build.rs에서 주입)
 pub fn base_url() -> String {
-    std::env::var("VDESK_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string())
+    std::env::var("VDESK_API_URL").unwrap_or_else(|_| env!("VDESK_API_URL").to_string())
 }
 
 // ─── 공통 응답 래퍼 ──────────────────────────────────────────────────────────
@@ -202,10 +204,10 @@ pub fn end_session(client: &ViewerClient, session_id: u64) -> Result<()> {
     Ok(())
 }
 
-/// URI 모드 전용 — viewer heartbeat (JWT 없이 sessionKey + sessionId로 호출)
-/// SessionTimeoutScheduler가 lastViewerSeenAt을 30초마다 확인하므로 10초 간격 호출 필요
+/// URI 모드 전용 — viewer heartbeat (JWT 없이 sessionKey를 capability token으로 사용)
+/// SessionTimeoutScheduler가 lastViewerSeenAt을 15s마다 확인하므로 10초 간격 호출
 pub fn viewer_heartbeat_uri(session_id: u64, session_key: &str) -> Result<ViewerHeartbeatData> {
-    let url = format!("{}/api/remote/session/viewer/heartbeat/{}", base_url(), session_id);
+    let url = format!("{}/api/remote/session/viewer/heartbeat-by-key/{}", base_url(), session_id);
     let client = reqwest::blocking::Client::builder()
         .cookie_store(true) // AT 쿠키 없어도 동작하지만 쿠키 jar 유지
         .timeout(std::time::Duration::from_secs(5))
