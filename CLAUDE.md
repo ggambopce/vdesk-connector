@@ -24,6 +24,17 @@ cargo check          # whole workspace
 
 VP9 requires **libvpx via vcpkg** (`x64-windows-static` triplet). Set `VCPKG_ROOT` before building if vcpkg is not at `C:\vcpkg`.
 
+### Build-time API URL injection
+
+Both `build.rs` files emit `cargo:rustc-env=VDESK_API_URL=<value>` so `env!("VDESK_API_URL")` in source is baked into the binary at compile time. Runtime `VDESK_API_URL` env var takes priority (useful for dev).
+
+```powershell
+# 배포용 빌드 (URL을 바이너리에 고정)
+.\deploy.ps1 -ApiUrl "https://your-server.com"
+```
+
+`deploy.ps1` builds both packages with `$env:VDESK_API_URL` set, then copies `vdesk_viewer.exe` to `../vdesk/src/main/resources/static/downloads/` for Spring Boot static serving.
+
 ## Running — Direct Mode (no backend required)
 
 ```powershell
@@ -67,11 +78,23 @@ Script params: `run_agent_local.ps1 [-ApiUrl str] [-Port str] [-LogLevel str]`; 
 
 **Viewer interactive device selection** (when `--device` is omitted): viewer lists linked devices → prompts for ID. If no linked devices, it calls the discover endpoint, lists unlinked agents, and calls `link_device` before connecting. Credentials can also be entered interactively if env vars are not set.
 
+## Deployment Scripts
+
+```powershell
+# VM에 에이전트 설치 (관리자 권한 — UAC 자동 처리)
+.\install_agent.ps1
+# → C:\VDesk\vdesk_agent.exe 복사, 방화벽 TCP 20020, 작업 스케줄러 AtLogOn+Highest, 즉시 시작
+
+.\uninstall_agent.ps1   # 스케줄러 해제, 방화벽 제거, 프로세스 종료, C:\VDesk\ 삭제
+```
+
+`install_agent.ps1`과 `vdesk_agent.exe`를 **같은 폴더**에 복사한 뒤 실행. 로그는 `C:\VDesk\logs\vdesk_agent.log` (append).
+
 ## Distribution (viewer only)
 
-`target/release/vdesk_viewer.exe` is a single-file distribution (~6.7 MB). Depends on `VCRUNTIME140.dll` (present on most Windows 10/11 systems). No other files needed.
+`target/release/vdesk_viewer.exe` is a single-file distribution (~7 MB). Depends on `VCRUNTIME140.dll` (present on most Windows 10/11 systems). No other files needed.
 
-Port 20020 TCP inbound must be open on the agent PC:
+Port 20020 TCP inbound must be open on the agent PC (handled automatically by `install_agent.ps1`):
 ```powershell
 New-NetFirewallRule -DisplayName "VDesk Agent" -Direction Inbound -Protocol TCP -LocalPort 20020 -Action Allow
 ```
@@ -97,7 +120,7 @@ Idle ──[activate]──► Pending ──[handshake OK]──► Streaming �
 ```
 Agent → POST /api/agent/register          → deviceKey  (persists localBox in %TEMP%\vdesk_agent_id)
 Agent → POST /api/agent/heartbeat         (10s loop)
-Agent → POST /api/agent/session/poll      (1s loop, single path)
+Agent → POST /api/agent/session/poll      (3s Idle / 1s Pending loop)
 Browser → POST /api/remote/session/create → {sessionKey, connectToken, relayIp, relayPort}
 Agent poll → POST /api/agent/session/activate/{sessionKey} → status=PENDING
 User clicks "뷰어 실행하기" → vdesk_viewer.exe launched via vdesk:// URI
@@ -106,6 +129,10 @@ Viewer → JSON handshake {sessionKey, connectToken, viewerNonce}
 Agent → POST /api/agent/sessions/verify-connect/{sessionKey} → status=RUNNING
 Browser poll detects RUNNING, heartbeat loop starts
 ```
+
+**Poll interval**: `poll_idle = 3s` (Idle 상태 — ngrok free tier 40 req/min 이내 유지), `poll_pending = 1s` (Pending 상태 — 세션 취소 즉시 감지).
+
+**Viewer heartbeat**: URI 모드 뷰어는 JWT 없이 `POST /api/remote/session/viewer/heartbeat-by-key/{sessionId}` 호출 (sessionKey를 capability token으로 사용). 기존 `/viewer/heartbeat/{sessionId}`는 JWT 필요.
 
 **TCP handshake format** (viewer → agent, sent as FramedStream bytes):
 ```json
@@ -229,3 +256,5 @@ VP9 bitrate: `VDESK_VP9_BITRATE_KBPS` env var (default 8000 kbps). Falls back to
 - `reqwest::blocking` must not be dropped inside a `block_on` context — the viewer drops `rt` before calling `end_session`.
 - VP9 C wrappers (`vpx_wrap.c`) are compiled via `cc` crate in `build.rs`; both agent and viewer have their own copy.
 - Agent's device UUID (`localBox`) persists across restarts in `%TEMP%\vdesk_agent_id`. Delete this file to force a fresh registration with the backend.
+- **DualLogger**: `main.rs` uses a custom `log::Log` impl that writes simultaneously to stderr and `<exe_dir>/logs/vdesk_agent.log`. Initialized via `init_logger()` before anything else. File is appended, never rotated.
+- **`vdesk_client/libs/virtual_display/dylib/`**: Contains `IddController.c` — a complete C implementation for creating/managing an IDD virtual display (used by RustDesk). Available for future integration to solve black-screen-on-minimize via virtual adapter.
