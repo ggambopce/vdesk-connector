@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use super::{
-    capture_dxgi::DxgiCapture,
+    capture_dxgi::{self, DxgiCapture},
     vpx_enc::VpxEncoder,
     yuv::{bgra_to_i420, bgra_to_i420_rects},
 };
@@ -96,12 +96,15 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
 
     timer::begin();
 
-    // DXGI 캡처 초기화 (재연결 시 이전 핸들 해제 or 디스플레이 전환 대기를 위해 재시도)
-    // 0x8000FFFF(E_UNEXPECTED): GPU 드라이버가 이전 세션 핸들을 아직 해제 중인 경우 발생.
-    // session.rs에서 1500ms 대기 후 진입하지만 드라이버가 느릴 수 있으므로 최대 20회 재시도.
+    // 이전 에이전트 프로세스가 남긴 고스트 Desktop Duplication 상태 강제 회수.
+    // TakeOwnership(exclusive) + ReleaseOwnership으로 GPU 드라이버가 이전 소유권을 포기하도록 함.
+    capture_dxgi::reclaim_output();
+
+    // DXGI 캡처 초기화 — 올바른 COM 해제 순서(capture_dxgi.rs Drop) + session.rs 1500ms 대기로
+    // 이전 세션 핸들이 정리된 상태. 추가로 드라이버 응답이 느릴 경우를 대비해 재시도.
+    // 초반 5회는 200ms 간격(빠른 회복), 이후 500ms 간격(총 최대 ~8.5초).
     let mut capture = {
         const MAX_ATTEMPTS: u8 = 20;
-        const RETRY_INTERVAL_MS: u64 = 500;
         let mut cap = None;
         for attempt in 1..=MAX_ATTEMPTS {
             match DxgiCapture::new() {
@@ -114,9 +117,10 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
                 }
                 Err(e) => {
                     if attempt < MAX_ATTEMPTS {
+                        let wait_ms = if attempt <= 5 { 200u64 } else { 500u64 };
                         log::warn!("[video] DXGI 초기화 실패 (시도 {}/{}): {:?} — {}ms 후 재시도",
-                            attempt, MAX_ATTEMPTS, e, RETRY_INTERVAL_MS);
-                        std::thread::sleep(Duration::from_millis(RETRY_INTERVAL_MS));
+                            attempt, MAX_ATTEMPTS, e, wait_ms);
+                        std::thread::sleep(Duration::from_millis(wait_ms));
                     } else {
                         log::error!("[video] DXGI 초기화 실패 (최종, {}회 시도): {:?}", MAX_ATTEMPTS, e);
                         return Err(e);

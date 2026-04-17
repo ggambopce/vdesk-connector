@@ -21,7 +21,7 @@ use winapi::{
     },
     um::{
         d3d11::*,
-        d3dcommon::D3D_DRIVER_TYPE_UNKNOWN,
+        d3dcommon,
         unknwnbase::IUnknown,
     },
 };
@@ -90,38 +90,21 @@ impl DxgiCapture {
     /// 주 모니터의 DXGI Desktop Duplication 캡처 생성
     pub fn new() -> Result<Self> {
         unsafe {
-            // 1. D3D11 디바이스 생성
+            // 1. D3D11 하드웨어 디바이스 생성
             let mut device: *mut ID3D11Device = ptr::null_mut();
             let mut context: *mut ID3D11DeviceContext = ptr::null_mut();
             let hr = D3D11CreateDevice(
-                ptr::null_mut(),             // pAdapter: NULL = 기본 어댑터
-                D3D_DRIVER_TYPE_UNKNOWN,     // DriverType: unknown (NULL adapter 사용 시)
-                ptr::null_mut(),             // Software: 없음
-                0,                           // Flags
-                ptr::null_mut(),             // pFeatureLevels: 기본
-                0,                           // FeatureLevels
+                ptr::null_mut(),                               // pAdapter: NULL = 기본 어댑터
+                winapi::um::d3dcommon::D3D_DRIVER_TYPE_HARDWARE, // HARDWARE 직접 사용
+                ptr::null_mut(), 0, ptr::null_mut(), 0,
                 D3D11_SDK_VERSION,
                 &mut device,
-                ptr::null_mut(),             // pFeatureLevel: 무시
+                ptr::null_mut(),
                 &mut context,
             );
-            // D3D_DRIVER_TYPE_UNKNOWN + NULL adapter 는 에러나므로 HARDWARE로 재시도
-            let (device, context) = if hr != S_OK {
-                let mut d: *mut ID3D11Device = ptr::null_mut();
-                let mut c: *mut ID3D11DeviceContext = ptr::null_mut();
-                let hr2 = D3D11CreateDevice(
-                    ptr::null_mut(),
-                    winapi::um::d3dcommon::D3D_DRIVER_TYPE_HARDWARE,
-                    ptr::null_mut(), 0, ptr::null_mut(), 0,
-                    D3D11_SDK_VERSION, &mut d, ptr::null_mut(), &mut c,
-                );
-                if hr2 != S_OK {
-                    return Err(anyhow!("D3D11CreateDevice 실패: 0x{:08X}", hr2));
-                }
-                (d, c)
-            } else {
-                (device, context)
-            };
+            if hr != S_OK {
+                return Err(anyhow!("D3D11CreateDevice 실패: 0x{:08X}", hr));
+            }
             let device = ComPtr(device);
             let context = ComPtr(context);
 
@@ -383,5 +366,101 @@ impl DxgiCapture {
                 has_dirty_rects: self.has_dirty_rects,
             }))
         }
+    }
+}
+
+// ── 이전 프로세스 고스트 상태 강제 회수 ──────────────────────────────────────
+
+/// 에이전트 시작 / 세션 시작 직전에 호출.
+///
+/// 이전 에이전트 프로세스가 비정상 종료되면 GPU 드라이버에 Desktop Duplication
+/// "고스트 상태"가 남아 다음 `DuplicateOutput` 호출이 `0x8000FFFF`를 반환한다.
+/// `IDXGIOutput::TakeOwnership(exclusive=true)` + `ReleaseOwnership()`으로
+/// 드라이버가 이전 소유권을 강제로 회수하도록 트리거한다.
+pub fn reclaim_output() {
+    unsafe {
+        // 임시 D3D 디바이스 생성
+        let mut device: *mut ID3D11Device = ptr::null_mut();
+        let mut _ctx:   *mut ID3D11DeviceContext = ptr::null_mut();
+        let hr = D3D11CreateDevice(
+            ptr::null_mut(),
+            winapi::um::d3dcommon::D3D_DRIVER_TYPE_HARDWARE,
+            ptr::null_mut(), 0, ptr::null_mut(), 0,
+            D3D11_SDK_VERSION, &mut device, ptr::null_mut(), &mut _ctx,
+        );
+        if hr != S_OK { return; }
+        // 로컬 변수는 역선언 순서로 drop → device가 마지막 (올바른 COM 해제 순서)
+        let _ctx    = ComPtr(_ctx);
+        let device  = ComPtr(device);
+
+        // IDXGIDevice → IDXGIAdapter → IDXGIOutput
+        let mut dxgi_dev: *mut IDXGIDevice = ptr::null_mut();
+        if (*device.0).QueryInterface(
+            &IID_IDXGIDevice,
+            &mut dxgi_dev as *mut *mut _ as *mut *mut _,
+        ) != S_OK { return; }
+        let dxgi_dev = ComPtr(dxgi_dev);
+
+        let mut adapter: *mut IDXGIAdapter = ptr::null_mut();
+        if (*dxgi_dev.0).GetParent(
+            &IID_IDXGIAdapter,
+            &mut adapter as *mut *mut _ as *mut *mut _,
+        ) != S_OK { return; }
+        let adapter = ComPtr(adapter);
+
+        let mut output: *mut IDXGIOutput = ptr::null_mut();
+        if (*adapter.0).EnumOutputs(0, &mut output) != S_OK { return; }
+        let output = ComPtr(output);
+
+        // TakeOwnership(exclusive=true): 이전 프로세스 Desktop Duplication 강제 회수
+        // ReleaseOwnership: 즉시 반납하여 후속 DuplicateOutput이 성공하도록 함
+        let hr = (*output.0).TakeOwnership(device.0 as *mut IUnknown, 1 /* TRUE = exclusive */);
+        if hr == S_OK {
+            (*output.0).ReleaseOwnership();
+            hbb_common::log::info!("[dxgi] 이전 세션 고스트 상태 강제 회수 완료");
+        } else {
+            hbb_common::log::debug!("[dxgi] TakeOwnership 불가 (hr=0x{:08X}) — 건너뜀", hr);
+        }
+        // output → adapter → dxgi_dev → _ctx → device 순으로 자동 drop (역선언 순서)
+    }
+}
+
+// ── 명시적 Drop: 올바른 COM 해제 순서 보장 ───────────────────────────────────
+//
+// Rust는 struct 필드를 선언 순서대로 drop하므로, 기본 동작 시 device가 가장 먼저
+// Release된다. 그러나 COM 규칙상 자식 객체(duplication, staging)는 부모(device)보다
+// 먼저 해제되어야 한다. 순서가 잘못되면 GPU 드라이버가 Desktop Duplication 상태를
+// 완전히 회수하지 못해 다음 DuplicateOutput 호출이 0x8000FFFF를 반환한다.
+impl Drop for DxgiCapture {
+    fn drop(&mut self) {
+        unsafe {
+            // 파이프라인 바인딩 초기화 + GPU 커맨드 큐 비우기
+            // (진행 중인 CopyResource/Map 작업이 완료된 뒤 리소스를 해제하기 위해 필수)
+            if !self.context.is_null() {
+                (*self.context.0).ClearState();
+                (*self.context.0).Flush();
+            }
+
+            // 자식 → 부모 순서로 명시적 Release
+            // (포인터를 null로 만들어 ComPtr 자동 Drop에서 중복 Release 방지)
+            if !self.staging.is_null() {
+                (*(self.staging.0 as *mut IUnknown)).Release();
+                self.staging.0 = ptr::null_mut();
+            }
+            if !self.duplication.is_null() {
+                (*(self.duplication.0 as *mut IUnknown)).Release();
+                self.duplication.0 = ptr::null_mut();
+            }
+            if !self.context.is_null() {
+                (*(self.context.0 as *mut IUnknown)).Release();
+                self.context.0 = ptr::null_mut();
+            }
+            // device는 모든 자식 해제 후 마지막으로 Release
+            if !self.device.is_null() {
+                (*(self.device.0 as *mut IUnknown)).Release();
+                self.device.0 = ptr::null_mut();
+            }
+        }
+        // ComPtr<T>의 자동 Drop: is_null() == true이므로 Release 호출 없음
     }
 }
