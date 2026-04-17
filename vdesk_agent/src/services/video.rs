@@ -1,13 +1,15 @@
 //! 화면 캡처 + VP9 인코딩 → VideoFrame → mpsc 채널
 //!
-//! 파이프라인:
-//!   DXGI Desktop Duplication (BGRA)
-//!     → BGRA→I420 변환 (순수 Rust)
-//!     → VP9 인코딩 (libvpx, C 래퍼)
-//!     → try_send → 세션 루프
+//! 캡처 상태 머신:
+//!   DXGI 초기 시도 (3회, 200ms 간격)
+//!     ├─ 성공 → DXGI 모드
+//!     │          캡처 오류 5회 연속 → 전체 스택 해제 후 DXGI 재초기화
+//!     │                              └─ 재초기화 실패 → GDI 모드 (30초마다 DXGI 복귀 시도)
+//!     └─ 실패 → GDI 모드 (30초마다 DXGI 복귀 시도)
 //!
-//! 폴백: DXGI 초기화 실패 시 → JPEG (screenshots 대신 winapi GDI BitBlt 사용 불가,
-//!       단순히 오류 반환)
+//! GDI 모드: winapi GDI BitBlt — RDP/터미널 세션, 드라이버 불안정 환경에서 사용
+//!   - DirtyRects 없음 → 매 프레임 전체 캡처, FNV 해시로 정적 화면 스킵
+//!   - 동일 VP9/JPEG 인코딩 파이프라인
 
 use anyhow::Result;
 use hbb_common::log;
@@ -16,6 +18,7 @@ use tokio::sync::mpsc;
 
 use super::{
     capture_dxgi::{self, DxgiCapture},
+    capture_gdi::GdiCapture,
     vpx_enc::VpxEncoder,
     yuv::{bgra_to_i420, bgra_to_i420_rects},
 };
@@ -28,6 +31,12 @@ const JPEG_QUALITY: u8 = 80;
 
 // VP9 비트레이트 (kbps): 1080p 원격 데스크톱 권장값
 const BITRATE_KBPS_DEFAULT: u32 = 8000;
+
+// DXGI 연속 실패 임계값 — 이 횟수 초과 시 전체 스택 재초기화
+const DXGI_FAIL_THRESHOLD: u32 = 5;
+
+// GDI 모드에서 DXGI 복귀 시도 간격
+const DXGI_RETRY_SECS: u64 = 30;
 
 // ── VideoFrame ───────────────────────────────────────────────────────────────
 
@@ -45,6 +54,25 @@ pub struct VideoFrame {
     pub fps:       u8,
     pub codec:     Codec,
     pub is_key:    bool,
+}
+
+// ── 캡처 모드 ────────────────────────────────────────────────────────────────
+
+enum CaptureState {
+    Dxgi(DxgiCapture),
+    Gdi(GdiCapture),
+}
+
+impl CaptureState {
+    fn label(&self) -> &'static str {
+        match self { Self::Dxgi(_) => "DXGI", Self::Gdi(_) => "GDI" }
+    }
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Dxgi(c) => (c.width, c.height),
+            Self::Gdi(c)  => (c.width, c.height),
+        }
+    }
 }
 
 // ── Windows 고해상도 타이머 ───────────────────────────────────────────────────
@@ -74,9 +102,8 @@ fn fnv_sample(data: &[u8]) -> u64 {
     h
 }
 
-// ── 캡처 루프 ────────────────────────────────────────────────────────────────
+// ── JPEG 인코딩 ──────────────────────────────────────────────────────────────
 
-/// BGRA 슬라이스를 JPEG 바이트로 인코딩
 fn encode_jpeg(bgra: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     use image::{codecs::jpeg::JpegEncoder, ImageBuffer, Rgb};
     let rgb: Vec<u8> = bgra.chunks_exact(4)
@@ -90,85 +117,81 @@ fn encode_jpeg(bgra: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+// ── 캡처 루프 ────────────────────────────────────────────────────────────────
+
 /// 화면 캡처 루프 — spawn_blocking 안에서 동기 실행
 pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result<()> {
     log::info!("[video] 캡처 시작: {}", session_key);
-
     timer::begin();
 
-    // 이전 에이전트 프로세스가 남긴 고스트 Desktop Duplication 상태 강제 회수.
-    // TakeOwnership(exclusive) + ReleaseOwnership으로 GPU 드라이버가 이전 소유권을 포기하도록 함.
+    // 이전 세션 고스트 Desktop Duplication 상태 강제 회수
     capture_dxgi::reclaim_output();
 
-    // DXGI 캡처 초기화 — 올바른 COM 해제 순서(capture_dxgi.rs Drop) + session.rs 1500ms 대기로
-    // 이전 세션 핸들이 정리된 상태. 추가로 드라이버 응답이 느릴 경우를 대비해 재시도.
-    // 초반 5회는 200ms 간격(빠른 회복), 이후 500ms 간격(총 최대 ~8.5초).
-    let mut capture = {
-        const MAX_ATTEMPTS: u8 = 20;
-        let mut cap = None;
-        for attempt in 1..=MAX_ATTEMPTS {
+    // ── DXGI 초기 시도 (3회, 빠른 실패) ─────────────────────────────────────
+    // session.rs의 1500ms 대기 + 올바른 COM 해제 순서로 이미 핸들이 정리된 상태.
+    // RDP 세션이나 드라이버 불안정 환경은 3회 시도로 즉시 판별 후 GDI로 전환.
+    let mut state = {
+        let mut dxgi = None;
+        for attempt in 1..=3u8 {
             match DxgiCapture::new() {
                 Ok(c) => {
                     if attempt > 1 {
-                        log::info!("[video] DXGI 초기화 성공 (시도 {}/{})", attempt, MAX_ATTEMPTS);
+                        log::info!("[video] DXGI 초기화 성공 (시도 {})", attempt);
                     }
-                    cap = Some(c);
+                    dxgi = Some(c);
                     break;
                 }
                 Err(e) => {
-                    if attempt < MAX_ATTEMPTS {
-                        let wait_ms = if attempt <= 5 { 200u64 } else { 500u64 };
-                        log::warn!("[video] DXGI 초기화 실패 (시도 {}/{}): {:?} — {}ms 후 재시도",
-                            attempt, MAX_ATTEMPTS, e, wait_ms);
-                        std::thread::sleep(Duration::from_millis(wait_ms));
-                    } else {
-                        log::error!("[video] DXGI 초기화 실패 (최종, {}회 시도): {:?}", MAX_ATTEMPTS, e);
-                        return Err(e);
+                    log::warn!("[video] DXGI 초기화 실패 ({}/3): {:?}", attempt, e);
+                    if attempt < 3 {
+                        std::thread::sleep(Duration::from_millis(200));
                     }
                 }
             }
         }
-        cap.unwrap()
+        match dxgi {
+            Some(c) => {
+                log::info!("[video] DXGI 모드 시작 ({}x{})", c.width, c.height);
+                CaptureState::Dxgi(c)
+            }
+            None => {
+                log::warn!("[video] ★ DXGI 불가 → GDI 모드로 시작 ({}초마다 DXGI 복귀 시도)",
+                    DXGI_RETRY_SECS);
+                CaptureState::Gdi(GdiCapture::new()?)
+            }
+        }
     };
 
-    let w = capture.width;
-    let h = capture.height;
-    log::info!("[video] {}x{} DXGI 캡처 초기화 완료", w, h);
+    let (w, h) = state.size();
 
     let bitrate_kbps = std::env::var("VDESK_VP9_BITRATE_KBPS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(BITRATE_KBPS_DEFAULT);
 
-    // VP9 인코더 초기화 (실패 시 JPEG 폴백)
     let mut encoder: Option<VpxEncoder> =
         match VpxEncoder::new(w, h, bitrate_kbps, TARGET_FPS as u32) {
         Ok(enc) => {
-            log::info!(
-                "[video] VP9 인코더 초기화 완료 ({}kbps, {}fps)",
-                bitrate_kbps,
-                TARGET_FPS
-            );
+            log::info!("[video] VP9 인코더 초기화 완료 ({}kbps, {}fps)", bitrate_kbps, TARGET_FPS);
             Some(enc)
         }
         Err(e) => {
-            log::warn!("[video] VP9 인코더 초기화 실패: {:?}", e);
-            log::warn!("[video] ★ JPEG 폴백 모드로 전환 (품질: {})", JPEG_QUALITY);
+            log::warn!("[video] VP9 인코더 초기화 실패: {:?} → JPEG 폴백", e);
             None
         }
     };
 
-    let mut i420_buf: Vec<u8>      = Vec::new();
-    let mut last_hash: u64         = 0;
-    let mut frames: u64            = 0;
-    let mut drop_count: u32        = 0;
-    let mut force_keyframe_on_next = false; // 채널 드롭 발생 시 다음 프레임을 키프레임으로 강제
-    let mut last_tick              = Instant::now();
+    let mut i420_buf              = Vec::<u8>::new();
+    let mut last_hash: u64        = 0;
+    let mut frames: u64           = 0;
+    let mut drop_count: u32       = 0;
+    let mut force_keyframe_on_next = false;
+    let mut dxgi_fail_streak: u32 = 0;
+    let mut last_dxgi_retry       = Instant::now();
+    let mut last_tick             = Instant::now();
 
     loop {
-        if tx.is_closed() {
-            break;
-        }
+        if tx.is_closed() { break; }
 
         // FPS 제한
         let elapsed = last_tick.elapsed();
@@ -177,72 +200,115 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
         }
         last_tick = Instant::now();
 
-        // DXGI 캡처
-        let frame = match capture.capture() {
-            Ok(Some(f)) => f,
-            Ok(None)    => continue, // 변화 없음
-            Err(e) => {
-                log::warn!("[video] DXGI 캡처 오류: {:?} — 재초기화 시도", e);
-                std::thread::sleep(Duration::from_millis(200));
-                match DxgiCapture::new() {
-                    Ok(c) => {
-                        capture = c;
-                        log::info!("[video] DXGI 재초기화 성공");
-                        continue;
-                    }
-                    Err(e2) => {
-                        log::error!("[video] DXGI 재초기화 실패: {:?}", e2);
-                        std::thread::sleep(Duration::from_millis(1000));
-                        continue;
-                    }
+        // ── GDI 모드: 주기적 DXGI 복귀 시도 ─────────────────────────────────
+        // match 블록 외부에서 실행 — state borrow 없음
+        if matches!(state, CaptureState::Gdi(_))
+            && last_dxgi_retry.elapsed() >= Duration::from_secs(DXGI_RETRY_SECS)
+        {
+            last_dxgi_retry = Instant::now();
+            match DxgiCapture::new() {
+                Ok(c) => {
+                    log::info!("[video] DXGI 복귀 성공 ({}x{}) → DXGI 모드 전환", c.width, c.height);
+                    state = CaptureState::Dxgi(c);
+                    dxgi_fail_streak = 0;
+                    force_keyframe_on_next = true;
+                    continue;
                 }
-            }
-        };
-
-        // 변화 감지 (FNV 샘플 해시)
-        // - is_full_frame=false(부분 캡처): 항상 전송 (변경 영역 확실)
-        // - is_full_frame=true + has_dirty_rects=false(DirtyRects 없음):
-        //     LastPresentTime != 0 이므로 화면이 바뀐 것은 확실하나 위치를 모름.
-        //     해시 샘플링이 작은 변경을 놓칠 수 있으므로 스킵 금지.
-        // - is_full_frame=true + has_dirty_rects=true(dirty 면적 >= 50%):
-        //     화면 절반 이상 변경 → 해시가 변화를 감지할 확률이 높아 스킵 적용.
-        let force_key = force_keyframe_on_next || frames % (TARGET_FPS * 10) == 0;
-        force_keyframe_on_next = false;
-        if frame.is_full_frame {
-            let hash = fnv_sample(frame.bgra);
-            let is_static = hash == last_hash;
-            last_hash = hash;
-            if is_static && !force_key && frame.has_dirty_rects {
-                continue;
+                Err(e) => {
+                    log::debug!("[video] DXGI 복귀 시도 실패 ({}초 후 재시도): {:?}",
+                        DXGI_RETRY_SECS, e);
+                }
             }
         }
 
-        // ── 인코딩 ──────────────────────────────────────────────────────────
-        let (encoded, codec, is_key) = if let Some(enc) = encoder.as_mut() {
-            // VP9 경로 — 변경 영역만 I420 업데이트 (전체 변경 시 전체 변환)
-            if frame.is_full_frame {
-                bgra_to_i420(frame.bgra, w as usize, h as usize, &mut i420_buf);
-            } else {
-                bgra_to_i420_rects(frame.bgra, w as usize, h as usize, &mut i420_buf, frame.dirty_rects);
-            }
-            match enc.encode(&i420_buf, force_key) {
-                Ok(Some((d, k))) => (d.to_vec(), Codec::Vp9, k),
-                Ok(None)         => continue,
-                Err(e) => {
-                    log::warn!("[video] VP9 인코딩 오류: {:?}", e);
-                    continue;
+        let force_key = force_keyframe_on_next || frames % (TARGET_FPS * 10) == 0;
+        force_keyframe_on_next = false;
+
+        // ── 캡처 + 인코딩 ────────────────────────────────────────────────────
+        // send_result는 Vec<u8>을 소유 — match 블록 이후 state를 자유롭게 교체 가능.
+        // frame.bgra / bgra 슬라이스 borrow는 각 arm 내에서만 살아있음 (NLL).
+        let send_result: Option<(Vec<u8>, Codec, bool)> = match &mut state {
+
+            CaptureState::Dxgi(cap) => match cap.capture() {
+                Ok(Some(frame)) => {
+                    dxgi_fail_streak = 0;
+
+                    // 정적 화면 스킵 (dirty_rects 기반 전체 프레임인 경우만)
+                    let skip = frame.is_full_frame && frame.has_dirty_rects && {
+                        let hash = fnv_sample(frame.bgra);
+                        let same = hash == last_hash;
+                        last_hash = hash;
+                        same && !force_key
+                    };
+                    if skip { None } else {
+                        encode_frame_dxgi(frame.bgra, frame.is_full_frame, frame.dirty_rects,
+                            w, h, &mut i420_buf, &mut encoder, force_key)
+                    }
                 }
-            }
-        } else {
-            // JPEG 폴백 경로
-            match encode_jpeg(frame.bgra, w, h) {
-                Ok(d) => (d, Codec::Jpeg, true),
+                Ok(None) => { dxgi_fail_streak = 0; None } // 변화 없음
                 Err(e) => {
-                    log::warn!("[video] JPEG 인코딩 오류: {:?}", e);
-                    continue;
+                    dxgi_fail_streak += 1;
+                    log::warn!("[video] DXGI 캡처 오류 ({}회 연속): {:?}", dxgi_fail_streak, e);
+                    std::thread::sleep(Duration::from_millis(100));
+                    None
                 }
-            }
+            },
+
+            CaptureState::Gdi(cap) => match cap.capture() {
+                Ok(bgra) => {
+                    let hash = fnv_sample(bgra);
+                    if hash == last_hash && !force_key {
+                        None // 변화 없음
+                    } else {
+                        last_hash = hash;
+                        encode_frame_gdi(bgra, w, h, &mut i420_buf, &mut encoder, force_key)
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[video] GDI 캡처 오류: {:?}", e);
+                    std::thread::sleep(Duration::from_millis(200));
+                    None
+                }
+            },
         };
+        // ↑ match 블록 종료 — state borrow 해제됨
+
+        // ── DXGI 연속 실패 → 전체 스택 재초기화 ────────────────────────────
+        // DXGI handles을 완전히 drop한 뒤 GPU 드라이버에 정리 시간을 주고 재시도.
+        // 재시도 실패 시 GDI 모드로 전환, 이후 30초마다 복귀 시도.
+        if dxgi_fail_streak >= DXGI_FAIL_THRESHOLD {
+            dxgi_fail_streak = 0;
+            log::warn!("[video] DXGI {}회 연속 실패 → 전체 스택 재초기화", DXGI_FAIL_THRESHOLD);
+
+            // DXGI Drop (ClearState + Flush + 역순 COM Release)
+            match GdiCapture::new() {
+                Ok(gdi) => {
+                    state = CaptureState::Gdi(gdi); // ← DxgiCapture Drop 트리거
+                    log::info!("[video] DXGI 핸들 해제 완료 — GPU 드라이버 정리 대기 500ms");
+                    std::thread::sleep(Duration::from_millis(500));
+
+                    match DxgiCapture::new() {
+                        Ok(c) => {
+                            log::info!("[video] DXGI 전체 재초기화 성공 → DXGI 모드 복귀");
+                            state = CaptureState::Dxgi(c);
+                        }
+                        Err(e2) => {
+                            log::error!("[video] DXGI 재초기화 실패 → GDI 모드 유지: {:?}", e2);
+                            last_dxgi_retry = Instant::now(); // 30초 후 복귀 재시도
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("[video] GDI 초기화 실패 — 치명적 오류: {:?}", e);
+                    break;
+                }
+            }
+            force_keyframe_on_next = true;
+            continue;
+        }
+
+        // ── 프레임 전송 ──────────────────────────────────────────────────────
+        let Some((encoded, codec, is_key)) = send_result else { continue };
 
         match tx.try_send(VideoFrame {
             data: encoded,
@@ -255,9 +321,9 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
             Ok(_) => { drop_count = 0; }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 drop_count += 1;
-                force_keyframe_on_next = true; // 드롭 후 다음 프레임은 키프레임으로 강제
+                force_keyframe_on_next = true;
                 if drop_count % 10 == 0 {
-                    log::warn!("[video] 채널 포화 드롭 {}회 — 다음 프레임 키프레임 강제", drop_count);
+                    log::warn!("[video] 채널 포화 드롭 {}회 (모드: {})", drop_count, state.label());
                 }
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
@@ -265,11 +331,64 @@ pub fn capture_loop(tx: mpsc::Sender<VideoFrame>, session_key: String) -> Result
 
         frames += 1;
         if frames % 300 == 0 {
-            log::debug!("[video] {}프레임 전송 (코덱: {:?})", frames, if encoder.is_some() { "VP9" } else { "JPEG" });
+            log::debug!("[video] {}프레임 전송 (모드: {}, 코덱: {})",
+                frames, state.label(), if encoder.is_some() { "VP9" } else { "JPEG" });
         }
     }
 
     timer::end();
     log::info!("[video] 캡처 루프 종료");
     Ok(())
+}
+
+// ── 인코딩 헬퍼 ──────────────────────────────────────────────────────────────
+
+fn encode_frame_dxgi<'a>(
+    bgra: &[u8],
+    is_full_frame: bool,
+    dirty_rects: &'a [capture_dxgi::DirtyRect],
+    w: u32, h: u32,
+    i420_buf: &mut Vec<u8>,
+    encoder: &mut Option<VpxEncoder>,
+    force_key: bool,
+) -> Option<(Vec<u8>, Codec, bool)> {
+    if let Some(enc) = encoder.as_mut() {
+        if is_full_frame {
+            bgra_to_i420(bgra, w as usize, h as usize, i420_buf);
+        } else {
+            bgra_to_i420_rects(bgra, w as usize, h as usize, i420_buf, dirty_rects);
+        }
+        match enc.encode(i420_buf, force_key) {
+            Ok(Some((d, k))) => Some((d.to_vec(), Codec::Vp9, k)),
+            Ok(None)         => None,
+            Err(e) => { log::warn!("[video] VP9 인코딩 오류: {:?}", e); None }
+        }
+    } else {
+        match encode_jpeg(bgra, w, h) {
+            Ok(d) => Some((d, Codec::Jpeg, true)),
+            Err(e) => { log::warn!("[video] JPEG 인코딩 오류: {:?}", e); None }
+        }
+    }
+}
+
+fn encode_frame_gdi(
+    bgra: &[u8],
+    w: u32, h: u32,
+    i420_buf: &mut Vec<u8>,
+    encoder: &mut Option<VpxEncoder>,
+    force_key: bool,
+) -> Option<(Vec<u8>, Codec, bool)> {
+    if let Some(enc) = encoder.as_mut() {
+        bgra_to_i420(bgra, w as usize, h as usize, i420_buf);
+        match enc.encode(i420_buf, force_key) {
+            Ok(Some((d, k))) => Some((d.to_vec(), Codec::Vp9, k)),
+            Ok(None)         => None,
+            Err(e) => { log::warn!("[video] GDI VP9 인코딩 오류: {:?}", e); None }
+        }
+    } else {
+        match encode_jpeg(bgra, w, h) {
+            Ok(d) => Some((d, Codec::Jpeg, true)),
+            Err(e) => { log::warn!("[video] GDI JPEG 인코딩 오류: {:?}", e); None }
+        }
+    }
 }
