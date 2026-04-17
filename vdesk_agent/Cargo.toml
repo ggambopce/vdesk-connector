@@ -2,7 +2,7 @@
 name = "vdesk_agent"
 version = "0.1.0"
 edition = "2021"
-description = "VDesk VM Agent — registers with backend, streams screen/audio, accepts direct TCP viewer connections"
+description = "VDesk VM Agent — registers with backend, pipes Spring noVNC proxy ↔ TightVNC :5900"
 
 [[bin]]
 name = "vdesk_agent"
@@ -17,25 +17,7 @@ reqwest = { version = "0.12", features = ["json", "native-tls"], default-feature
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-protobuf = { version = "3.7", features = ["with-bytes"] }
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1.0"
 chrono = "0.4"
-
-# JPEG 폴백 (VP9 실패 시)
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-winapi = { version = "0.3", features = [
-    "winsock2", "iphlpapi", "winuser", "timeapi",
-    # DXGI Desktop Duplication
-    "dxgi", "dxgi1_2", "dxgitype", "dxgiformat",
-    "d3d11", "d3dcommon",
-    "winerror",
-    # GDI BitBlt 폴백 캡처
-    "wingdi",
-] }
-
-[build-dependencies]
-cc = "1"

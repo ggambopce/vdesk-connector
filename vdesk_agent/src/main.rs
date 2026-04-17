@@ -1,8 +1,8 @@
-//! VDesk Agent — VM에 설치되어 백엔드에 등록하고 뷰어의 직접 TCP 연결을 수락합니다.
+//! VDesk Agent — VM에 설치되어 백엔드에 등록하고 Spring noVNC 프록시 연결을 TightVNC로 파이프합니다.
 //!
 //! 구조:
 //!   - main() : 백엔드 폴링 담당 (heartbeat + poll/activate → Pending 상태 설정)
-//!   - server : 원격 제어 담당 (TCP 수락 → Streaming 상태 → 세션 종료 → Idle)
+//!   - server : TCP 프록시 담당 (Spring 연결 수락 → TightVNC :5900 파이프 → Idle)
 //!   공유 상태(SharedState)로 두 역할을 명확히 분리합니다.
 //!
 //! 환경변수:
@@ -12,13 +12,10 @@
 //!   AGENT_PORT      — 리스닝 포트 (기본: 20020)
 //!   AGENT_RELAY_IP  — 뷰어에게 알려줄 접속 IP (기본: 자동 감지)
 //!                     같은 PC에서 테스트할 때: AGENT_RELAY_IP=127.0.0.1
-//!   AGENT_NO_INJECT — 1로 설정 시 입력 주입 비활성화 (스트리밍만 테스트할 때)
 //!   RUST_LOG        — 로그 레벨 (기본: info)
 
 mod api;
 mod server;
-mod session;
-mod services;
 mod state;
 
 use anyhow::Result;
@@ -117,24 +114,12 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| "direct".to_string());
         log::info!("★ 다이렉트 모드 (백엔드 불필요) — 세션키: {}", session_key);
 
-        // AGENT_NO_INJECT=1이면 입력 주입 비활성화
-        if std::env::var("AGENT_NO_INJECT").map_or(false, |v| v == "1") {
-            services::input::set_no_inject(true);
-            log::info!("입력 주입 비활성화 (AGENT_NO_INJECT=1)");
-        }
-
         return server::listen_loop_direct(session_key).await;
     }
 
     // AGENT_RELAY_IP 환경변수 우선 사용 (같은 PC 테스트: 127.0.0.1)
     let local_ip = std::env::var("AGENT_RELAY_IP").unwrap_or_else(|_| get_local_ip());
     log::info!("Relay IP: {}", local_ip);
-
-    // AGENT_NO_INJECT=1 이면 입력 주입 비활성화 (명시적 옵션)
-    if std::env::var("AGENT_NO_INJECT").map_or(false, |v| v == "1") {
-        services::input::set_no_inject(true);
-        log::info!("입력 주입 비활성화 (AGENT_NO_INJECT=1)");
-    }
 
     let local_box = load_or_create_local_box();
     log::info!("LocalBox: {}", local_box);
