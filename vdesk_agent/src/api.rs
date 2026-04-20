@@ -175,3 +175,39 @@ pub async fn end_session(req: &EndRequest) -> Result<()> {
     }
     Ok(())
 }
+
+// ─── 파일 전송 API ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Debug)]
+pub struct PendingFile {
+    #[serde(rename = "fileId")]
+    pub file_id: String,
+    pub filename: String,
+}
+
+#[derive(Deserialize)]
+struct PendingFilesResult {
+    result: Option<Vec<PendingFile>>,
+}
+
+pub async fn get_pending_files(device_key: &str) -> Result<Vec<PendingFile>> {
+    let url = format!("{}/api/agent/files/pending/{}", base_url(), device_key);
+    let resp = client().get(&url).send().await?;
+    let body: PendingFilesResult = resp.json().await?;
+    Ok(body.result.unwrap_or_default())
+}
+
+pub async fn download_file(file_id: &str) -> Result<bytes::Bytes> {
+    let url = format!("{}/api/agent/files/download/{}", base_url(), file_id);
+    let resp = client().get(&url).send().await?;
+    if !resp.status().is_success() {
+        bail!("Download failed: {}", resp.status());
+    }
+    Ok(resp.bytes().await?)
+}
+
+pub async fn confirm_file(file_id: &str) -> Result<()> {
+    let url = format!("{}/api/agent/files/confirm/{}", base_url(), file_id);
+    client().post(&url).send().await?;
+    Ok(())
+}

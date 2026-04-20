@@ -206,8 +206,8 @@ async fn main() -> Result<()> {
                 }
             };
 
-            if let Some((session_key, device_key)) = pending_info {
-                let check_req = api::EndRequest { device_key, session_key };
+            if let Some((session_key, device_key_pending)) = pending_info {
+                let check_req = api::EndRequest { device_key: device_key_pending, session_key };
                 match api::check_pending_session(&check_req).await {
                     Ok(data) if data.should_reset => {
                         log::info!("[pending] 백엔드 세션 취소 감지 → Idle 복귀");
@@ -216,6 +216,31 @@ async fn main() -> Result<()> {
                     Ok(_) => log::trace!("[pending] 세션 유효 — 뷰어 대기 중"),
                     Err(e) => log::warn!("[pending] check-pending 실패 (무시): {:?}", e),
                 }
+            } else {
+                // Streaming 상태: 파일 전송 체크 (5초 간격)
+                match api::get_pending_files(&device_key).await {
+                    Ok(files) if !files.is_empty() => {
+                        for f in files {
+                            match api::download_file(&f.file_id).await {
+                                Ok(data) => {
+                                    let dest = desktop_path(&f.filename);
+                                    if std::fs::write(&dest, &data).is_ok() {
+                                        log::info!("[file] 수신: {} → {:?}", f.filename, dest);
+                                        if let Err(e) = api::confirm_file(&f.file_id).await {
+                                            log::warn!("[file] confirm 실패: {:?}", e);
+                                        }
+                                    } else {
+                                        log::warn!("[file] 저장 실패: {:?}", dest);
+                                    }
+                                }
+                                Err(e) => log::warn!("[file] 다운로드 실패 ({}): {:?}", f.file_id, e),
+                            }
+                        }
+                    }
+                    Ok(_) => log::trace!("[file] 대기 파일 없음"),
+                    Err(e) => log::debug!("[file] 파일 체크 실패 (무시): {:?}", e),
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
 
             tokio::time::sleep(poll_pending).await;
@@ -308,6 +333,13 @@ fn load_or_create_local_box() -> String {
     let id = format!("box{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
     let _ = std::fs::write(&path, &id);
     id
+}
+
+fn desktop_path(filename: &str) -> std::path::PathBuf {
+    let base = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| "C:\\Users\\Default".to_string());
+    std::path::Path::new(&base).join("Desktop").join(filename)
 }
 
 fn get_hostname() -> String {
