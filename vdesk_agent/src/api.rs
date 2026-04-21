@@ -176,6 +176,22 @@ pub async fn end_session(req: &EndRequest) -> Result<()> {
     Ok(())
 }
 
+/// Streaming 상태에서 세션 alive 신호 전송 — lastAgentSeenAt 갱신
+/// 반환: shouldTerminate=true 이면 세션이 서버에서 종료됨 → Idle 복귀 필요
+pub async fn session_heartbeat(device_key: &str, session_key: &str) -> Result<bool> {
+    let url = format!("{}/api/agent/session/heartbeat", base_url());
+    let body = serde_json::json!({
+        "deviceKey":  device_key,
+        "sessionKey": session_key,
+    });
+    let resp = client().post(&url).json(&body).send().await?;
+    if !resp.status().is_success() {
+        bail!("session_heartbeat failed: {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    Ok(v["result"]["shouldTerminate"].as_bool().unwrap_or(false))
+}
+
 // ─── 파일 전송 API ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Debug)]

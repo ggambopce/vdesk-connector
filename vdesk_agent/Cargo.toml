@@ -9,7 +9,6 @@ name = "vdesk_agent"
 path = "src/main.rs"
 
 [dependencies]
-hbb_common = { path = "../vdesk_client/vdesk_client/libs/hbb_common" }
 bytes = "1"
 
 tokio = { version = "1", features = ["full"] }

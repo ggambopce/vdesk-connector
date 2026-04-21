@@ -17,7 +17,7 @@ mod server;
 mod state;
 
 use anyhow::Result;
-use hbb_common::log;
+use log;
 use state::AgentState;
 use std::{
     fs::{self, OpenOptions},
@@ -153,10 +153,12 @@ async fn main() -> Result<()> {
     });
 
     // ── 백엔드 폴링 담당: heartbeat + poll 루프 ───────────────────────────────
-    let hb_interval   = Duration::from_secs(10); // 비정상 종료 감지: 10s
-    let poll_idle     = Duration::from_secs(3);  // Idle: 3s — ngrok free 40req/min 이내 (20/min)
-    let poll_pending  = Duration::from_secs(1);  // Pending: 1s — 세션 취소 즉시 감지
+    let hb_interval       = Duration::from_secs(10); // 비정상 종료 감지: 10s
+    let poll_idle         = Duration::from_secs(3);  // Idle: 3s — ngrok free 40req/min 이내 (20/min)
+    let poll_pending      = Duration::from_secs(1);  // Pending: 1s — 세션 취소 즉시 감지
+    let session_hb_interval = Duration::from_secs(10); // Streaming: 세션 alive 신호 10s
     let mut last_hb = std::time::Instant::now();
+    let mut last_session_hb = std::time::Instant::now();
 
     log::info!("백엔드 폴링 루프 시작");
     loop {
@@ -206,28 +208,55 @@ async fn main() -> Result<()> {
                     Err(e) => log::warn!("[pending] check-pending 실패 (무시): {:?}", e),
                 }
             } else {
-                // Streaming 상태: 파일 전송 체크 (5초 간격)
-                match api::get_pending_files(&device_key).await {
-                    Ok(files) if !files.is_empty() => {
-                        for f in files {
-                            match api::download_file(&f.file_id).await {
-                                Ok(data) => {
-                                    let dest = desktop_path(&f.filename);
-                                    if std::fs::write(&dest, &data).is_ok() {
-                                        log::info!("[file] 수신: {} → {:?}", f.filename, dest);
-                                        if let Err(e) = api::confirm_file(&f.file_id).await {
-                                            log::warn!("[file] confirm 실패: {:?}", e);
+                // Streaming 상태: 세션 heartbeat (10s) + 파일 전송 체크 (5s)
+                let streaming_sk = {
+                    let s = shared_state.lock().unwrap();
+                    match &*s {
+                        AgentState::Streaming { session_key } => Some(session_key.clone()),
+                        _ => None,
+                    }
+                };
+
+                if let Some(sk) = streaming_sk {
+                    // 세션 heartbeat — lastAgentSeenAt 갱신 + shouldTerminate 확인
+                    if last_session_hb.elapsed() >= session_hb_interval {
+                        match api::session_heartbeat(&device_key, &sk).await {
+                            Ok(true) => {
+                                log::info!("[session-hb] shouldTerminate=true → Idle 복귀");
+                                *shared_state.lock().unwrap() = AgentState::Idle;
+                                last_session_hb = std::time::Instant::now();
+                                tokio::time::sleep(poll_pending).await;
+                                continue;
+                            }
+                            Ok(false) => log::debug!("[session-hb] OK"),
+                            Err(e)    => log::warn!("[session-hb] 실패 (무시): {:?}", e),
+                        }
+                        last_session_hb = std::time::Instant::now();
+                    }
+
+                    // 파일 전송 체크
+                    match api::get_pending_files(&device_key).await {
+                        Ok(files) if !files.is_empty() => {
+                            for f in files {
+                                match api::download_file(&f.file_id).await {
+                                    Ok(data) => {
+                                        let dest = desktop_path(&f.filename);
+                                        if std::fs::write(&dest, &data).is_ok() {
+                                            log::info!("[file] 수신: {} → {:?}", f.filename, dest);
+                                            if let Err(e) = api::confirm_file(&f.file_id).await {
+                                                log::warn!("[file] confirm 실패: {:?}", e);
+                                            }
+                                        } else {
+                                            log::warn!("[file] 저장 실패: {:?}", dest);
                                         }
-                                    } else {
-                                        log::warn!("[file] 저장 실패: {:?}", dest);
                                     }
+                                    Err(e) => log::warn!("[file] 다운로드 실패 ({}): {:?}", f.file_id, e),
                                 }
-                                Err(e) => log::warn!("[file] 다운로드 실패 ({}): {:?}", f.file_id, e),
                             }
                         }
+                        Ok(_) => log::trace!("[file] 대기 파일 없음"),
+                        Err(e) => log::debug!("[file] 파일 체크 실패 (무시): {:?}", e),
                     }
-                    Ok(_) => log::trace!("[file] 대기 파일 없음"),
-                    Err(e) => log::debug!("[file] 파일 체크 실패 (무시): {:?}", e),
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
