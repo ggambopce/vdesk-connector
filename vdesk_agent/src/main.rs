@@ -6,8 +6,6 @@
 //!   공유 상태(SharedState)로 두 역할을 명확히 분리합니다.
 //!
 //! 환경변수:
-//!   VDESK_DIRECT    — 1이면 백엔드 없이 다이렉트 모드 실행
-//!   VDESK_DIRECT_KEY— 다이렉트 모드 세션키 (기본: "direct")
 //!   VDESK_API_URL   — 백엔드 서버 URL (기본: http://localhost:8080)
 //!   AGENT_PORT      — 리스닝 포트 (기본: 20020)
 //!   AGENT_RELAY_IP  — 뷰어에게 알려줄 접속 IP (기본: 자동 감지)
@@ -107,15 +105,6 @@ fn init_logger() {
 async fn main() -> Result<()> {
     init_logger();
     log::info!("VDesk Agent 시작 (API: {})", api::base_url());
-
-    // ── 다이렉트 모드: 백엔드 없이 뷰어와 직접 연결 ─────────────────────────
-    if std::env::var("VDESK_DIRECT").map_or(false, |v| v == "1") {
-        let session_key = std::env::var("VDESK_DIRECT_KEY")
-            .unwrap_or_else(|_| "direct".to_string());
-        log::info!("★ 다이렉트 모드 (백엔드 불필요) — 세션키: {}", session_key);
-
-        return server::listen_loop_direct(session_key).await;
-    }
 
     // AGENT_RELAY_IP 환경변수 우선 사용 (같은 PC 테스트: 127.0.0.1)
     let local_ip = std::env::var("AGENT_RELAY_IP").unwrap_or_else(|_| get_local_ip());

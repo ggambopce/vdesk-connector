@@ -116,28 +116,3 @@ async fn pipe_to_vnc(spring_tcp: TcpStream, session_key: &str, _device_key: &str
     log::info!("[server] VNC 파이프 종료 (session={})", &session_key[..8]);
     Ok(())
 }
-
-/// 다이렉트 모드 (VDESK_DIRECT=1) — 백엔드 없이 VNC 바로 파이프 (테스트용)
-pub async fn listen_loop_direct(_fixed_key: String) -> Result<()> {
-    let port = std::env::var("AGENT_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(LISTEN_PORT);
-
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-    let listener = TcpListener::bind(addr).await?;
-    log::info!("[server] 다이렉트 모드 — VNC 파이프 대기 (포트 {} → :{})", port, VNC_PORT);
-
-    loop {
-        let (spring_tcp, peer_addr) = listener.accept().await?;
-        log::info!("[server] 연결 수락: {}", peer_addr);
-        spring_tcp.set_nodelay(true).ok();
-
-        tokio::spawn(async move {
-            if let Err(e) = pipe_to_vnc(spring_tcp, "direct", "direct").await {
-                log::error!("[server] VNC 파이프 오류: {:?}", e);
-            }
-            log::info!("[server] 세션 종료 — 다음 연결 대기");
-        });
-    }
-}
