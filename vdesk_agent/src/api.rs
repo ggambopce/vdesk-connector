@@ -26,6 +26,24 @@ pub struct RegisterRequest {
     pub relay_ip: String,
     #[serde(rename = "relayPort")]
     pub relay_port: u16,
+
+    // 시스템 사양 (수집 실패 시 null 전송)
+    #[serde(rename = "publicIp", skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<String>,
+    #[serde(rename = "internalIp", skip_serializing_if = "Option::is_none")]
+    pub internal_ip: Option<String>,
+    #[serde(rename = "os", skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(rename = "osBit", skip_serializing_if = "Option::is_none")]
+    pub os_bit: Option<String>,
+    #[serde(rename = "cpu", skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+    #[serde(rename = "ram", skip_serializing_if = "Option::is_none")]
+    pub ram: Option<u32>,
+    #[serde(rename = "gpu", skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<String>,
+    #[serde(rename = "disk", skip_serializing_if = "Option::is_none")]
+    pub disk: Option<u32>,
 }
 
 #[derive(Deserialize, Debug)]

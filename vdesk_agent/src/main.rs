@@ -26,6 +26,7 @@ use std::{
     sync::Mutex,
     time::Duration,
 };
+use sysinfo::{Disks, System};
 use uuid::Uuid;
 
 // ── DualLogger: stderr + 파일 동시 출력 ──────────────────────────────────────
@@ -128,6 +129,16 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(server::LISTEN_PORT);
 
+    // ── 시스템 사양 수집 (등록 전, 실패해도 계속 진행) ────────────────────────
+    let sys_info = collect_system_info();
+    let gpu      = get_gpu_name();
+    let public_ip = get_public_ip().await;
+    let internal_ip = Some(get_local_ip()); // relayIp는 환경변수 오버라이드 가능, internalIp는 항상 실제 로컬 IP
+    log::info!(
+        "시스템 정보 — OS: {:?}, CPU: {:?}, RAM: {:?}GB, Disk: {:?}GB, GPU: {:?}, PublicIP: {:?}",
+        sys_info.os, sys_info.cpu, sys_info.ram, sys_info.disk, gpu, public_ip
+    );
+
     // ── 백엔드 등록 ───────────────────────────────────────────────────────────
     let reg_data = api::register(&api::RegisterRequest {
         local_box,
@@ -136,6 +147,14 @@ async fn main() -> Result<()> {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         relay_ip: local_ip.clone(),
         relay_port,
+        public_ip,
+        internal_ip,
+        os: sys_info.os,
+        os_bit: Some(sys_info.os_bit),
+        cpu: sys_info.cpu,
+        ram: sys_info.ram,
+        gpu,
+        disk: sys_info.disk,
     })
     .await?;
     let device_key = reg_data.device_key.clone();
@@ -369,4 +388,82 @@ fn get_hostname() -> String {
     {
         std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
     }
+}
+
+// ── 시스템 사양 수집 ──────────────────────────────────────────────────────────
+
+struct SystemInfo {
+    os:     Option<String>,
+    os_bit: String,
+    cpu:    Option<String>,
+    ram:    Option<u32>,   // GB
+    disk:   Option<u32>,   // GB (전체 합산)
+}
+
+fn collect_system_info() -> SystemInfo {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    // OS 이름 + 버전 (예: "Windows 10.0.19044")
+    let os = System::name()
+        .zip(System::os_version())
+        .map(|(name, ver)| format!("{} {}", name, ver));
+
+    let os_bit = if cfg!(target_pointer_width = "64") { "64bit" } else { "32bit" }.to_string();
+
+    // CPU 브랜드 (첫 번째 코어 이름, 공백 정리)
+    let cpu = sys.cpus().first()
+        .map(|c| c.brand().trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // RAM (총 물리 메모리 → GB)
+    let ram = {
+        let total = sys.total_memory(); // bytes
+        if total > 0 { Some((total / 1_073_741_824).max(1) as u32) } else { None }
+    };
+
+    // Disk (모든 마운트된 디스크 총 용량 합산 → GB)
+    let disk = {
+        let disks = Disks::new_with_refreshed_list();
+        let total: u64 = disks.iter().map(|d| d.total_space()).sum();
+        if total > 0 { Some((total / 1_073_741_824).max(1) as u32) } else { None }
+    };
+
+    SystemInfo { os, os_bit, cpu, ram, disk }
+}
+
+fn get_gpu_name() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("wmic")
+            .args(["path", "win32_VideoController", "get", "name", "/format:value"])
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // "Name=NVIDIA GeForce RTX 3080\r\r\n" 형식 파싱 — 첫 번째 결과만 사용
+        for line in stdout.lines() {
+            if let Some(val) = line.strip_prefix("Name=") {
+                let name = val.trim().to_string();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    { None }
+}
+
+async fn get_public_ip() -> Option<String> {
+    let resp = tokio::time::timeout(
+        Duration::from_secs(3),
+        reqwest::get("https://api.ipify.org"),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let text = resp.text().await.ok()?;
+    let ip = text.trim().to_string();
+    if ip.is_empty() { None } else { Some(ip) }
 }

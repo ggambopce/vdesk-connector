@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## Repository Layout
 
@@ -149,23 +149,6 @@ let relay_ip = std::env::var("AGENT_RELAY_IP")
 | `vdesk_agent/src/api.rs` | 백엔드 HTTP 요청/응답 타입 (register, heartbeat, poll, activate, files) |
 | `vdesk_agent/src/state.rs` | `AgentState` enum + `SharedState = Arc<Mutex<AgentState>>` |
 | `install_agent.ps1` | VM 자동 설치 (TightVNC + 에이전트 + 방화벽 + 스케줄러) |
-
-## System Info Collection (Registration)
-
-On first register (`POST /api/agent/register`), the agent auto-collects VM specs and sends them as optional fields. Spring applies **first-write-wins** policy — existing values are never overwritten on re-registration.
-
-| Field | Source |
-|-------|--------|
-| `cpu` | `sysinfo::System::cpus()[0].brand()` |
-| `ram` | `sysinfo::System::total_memory()` / 1 GB |
-| `disk` | `sysinfo::Disks` total space sum / 1 GB |
-| `os` | `System::name()` + `System::os_version()` |
-| `osBit` | `cfg!(target_pointer_width="64")` → "64bit" |
-| `gpu` | `wmic path win32_VideoController get name` (Windows only) |
-| `internalIp` | `get_local_ip()` (UDP trick → local interface) |
-| `publicIp` | `GET https://api.ipify.org` (3s timeout, fallback: omit) |
-
-All fields wrapped in `Option<>` — collection failure → `None` → field omitted from JSON (`skip_serializing_if`).
 
 ## Key Conventions
 
