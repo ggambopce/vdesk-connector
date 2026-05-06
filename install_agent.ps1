@@ -4,15 +4,25 @@
     VDesk Agent 설치 스크립트 — 입력 없이 완료
 .DESCRIPTION
     1. 관리자 권한 확인 (없으면 UAC 재실행)
-    2. C:\VDesk\ 에 vdesk_agent.exe 복사
+    2. C:\VDesk\ 에 vdesk_agent.exe 복사 + config.json 생성
     3. TightVNC 서버 설치 (VNC 원격 화면 제공용, 포트 5900)
     4. 방화벽 TCP 20020 inbound 허용 (5900은 내부 전용 — 외부 차단)
-    5. 작업 스케줄러 "VDeskAgent" 등록 (로그온 시 자동 시작, 최상위 권한)
+    5. 작업 스케줄러 "VDeskAgent" 등록 (부팅 시 자동 시작, SYSTEM 계정)
     6. 즉시 실행
 
-환경변수:
-    VNC_PASSWORD  — TightVNC 비밀번호 (기본: "vdesk1234")
+파라미터:
+    -ApiUrl      — VDesk 서버 URL (기본: "https://vdesk.co.kr")
+    -Port        — 에이전트 리스닝 포트 (기본: "20020")
+    -VncPassword — TightVNC 비밀번호 (기본: "1234")
+
+환경변수 override:
+    VNC_PASSWORD  — TightVNC 비밀번호 (-VncPassword 파라미터보다 우선)
 #>
+param(
+    [string]$ApiUrl      = "https://vdesk.co.kr",
+    [string]$Port        = "20020",
+    [string]$VncPassword = "1234"
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -31,7 +41,8 @@ $ExeName      = "vdesk_agent.exe"
 $TaskName     = "VDeskAgent"
 $FirewallRule = "VDesk Agent TCP 20020"
 $SrcExe       = Join-Path $PSScriptRoot $ExeName
-$VncPassword  = if ($env:VNC_PASSWORD) { $env:VNC_PASSWORD } else { "vdesk1234" }
+# 환경변수 override 지원 (Inno Setup 없이 직접 실행 시)
+if ($env:VNC_PASSWORD) { $VncPassword = $env:VNC_PASSWORD }
 
 # TightVNC 설치 관련 상수
 $TvncVersion  = "2.8.85"
@@ -50,9 +61,21 @@ Write-Host "[1/6] 설치 디렉터리 생성: $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path "$InstallDir\logs" | Out-Null
 
+# config.json 생성 (에이전트가 API URL 읽기용)
+$config = [ordered]@{ api_url = $ApiUrl; port = [int]$Port } | ConvertTo-Json
+Set-Content -Path "$InstallDir\config.json" -Value $config -Encoding UTF8
+Write-Host "      config.json: $InstallDir\config.json (api_url=$ApiUrl)"
+
 # ── exe 복사 ──────────────────────────────────────────────────────────────────
-Write-Host "[2/6] 에이전트 복사: $SrcExe → $InstallDir\$ExeName"
-Copy-Item $SrcExe "$InstallDir\$ExeName" -Force
+$DstExe = "$InstallDir\$ExeName"
+Write-Host "[2/6] 에이전트 복사: $SrcExe → $DstExe"
+$srcResolved = (Resolve-Path $SrcExe).Path
+$dstResolved = if (Test-Path $DstExe) { (Resolve-Path $DstExe).Path } else { "" }
+if ($srcResolved -ne $dstResolved) {
+    Copy-Item $SrcExe $DstExe -Force
+} else {
+    Write-Host "      (같은 경로 — 복사 생략)"
+}
 
 # ── TightVNC 서버 설치 ────────────────────────────────────────────────────────
 Write-Host "[3/6] TightVNC 서버 설치 (포트 5900, 비밀번호 인증)"
@@ -73,13 +96,21 @@ if ($tvncInstalled) {
 
 if (-not $tvncInstalled) {
     $tvncInstallOk = $false
-    Write-Host "      TightVNC MSI 다운로드 중: $TvncUrl"
-    try {
-        Invoke-WebRequest -Uri $TvncUrl -OutFile $TvncInstaller -UseBasicParsing
+    # 스크립트와 같은 폴더에 TightVNC.msi 있으면 번들 사용 (오프라인 설치 지원)
+    $bundledMsi = Join-Path $PSScriptRoot "TightVNC.msi"
+    if (Test-Path $bundledMsi) {
+        Write-Host "      번들 TightVNC.msi 사용 (오프라인)"
+        $TvncInstaller = $bundledMsi
         $tvncInstallOk = $true
-    } catch {
-        Write-Warning "다운로드 실패: $_"
-        Write-Warning "TightVNC를 수동 설치하고 포트 5900에서 실행하세요."
+    } else {
+        Write-Host "      TightVNC MSI 다운로드 중: $TvncUrl"
+        try {
+            Invoke-WebRequest -Uri $TvncUrl -OutFile $TvncInstaller -UseBasicParsing
+            $tvncInstallOk = $true
+        } catch {
+            Write-Warning "다운로드 실패: $_"
+            Write-Warning "TightVNC를 수동 설치하고 포트 5900에서 실행하세요."
+        }
     }
 
     if ($tvncInstallOk) {
@@ -152,7 +183,7 @@ Write-Host "[5/6] 작업 스케줄러 등록: $TaskName"
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
 $action  = New-ScheduledTaskAction -Execute "$InstallDir\$ExeName"
-$trigger = New-ScheduledTaskTrigger -AtLogOn
+$trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
     -RestartCount 3 `
@@ -160,8 +191,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable
 
 $principal = New-ScheduledTaskPrincipal `
-    -UserId    $env:USERNAME `
-    -LogonType Interactive `
+    -UserId    "SYSTEM" `
+    -LogonType ServiceAccount `
     -RunLevel  Highest
 
 Register-ScheduledTask `
@@ -183,9 +214,8 @@ Write-Host ""
 Write-Host "✓ VDesk Agent 설치 완료"
 Write-Host "  설치 경로 : $InstallDir\$ExeName"
 Write-Host "  로그 파일 : $InstallDir\logs\vdesk_agent.log"
-Write-Host "  자동 시작 : 로그온 시 (작업 스케줄러 '$TaskName')"
+Write-Host "  자동 시작 : 시스템 시작 시 (작업 스케줄러 '$TaskName', SYSTEM 계정)"
 Write-Host "  방화벽    : TCP 20020 inbound 허용 / TCP 5900 외부 차단"
 Write-Host "  TightVNC  : 포트 5900 (내부 전용, 에이전트가 중계)"
 Write-Host ""
 Write-Host "  VNC 비밀번호: $VncPassword"
-Write-Host "  (환경변수 VNC_PASSWORD 로 변경 가능)"

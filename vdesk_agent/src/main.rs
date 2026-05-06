@@ -1,3 +1,4 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 //! VDesk Agent — VM에 설치되어 백엔드에 등록하고 Spring noVNC 프록시 연결을 TightVNC로 파이프합니다.
 //!
 //! 구조:
@@ -104,6 +105,7 @@ fn init_logger() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_config_to_env();
     init_logger();
     log::info!("VDesk Agent 시작 (API: {})", api::base_url());
 
@@ -139,8 +141,8 @@ async fn main() -> Result<()> {
         sys_info.os, sys_info.cpu, sys_info.ram, sys_info.disk, gpu, public_ip
     );
 
-    // ── 백엔드 등록 ───────────────────────────────────────────────────────────
-    let reg_data = api::register(&api::RegisterRequest {
+    // ── 백엔드 등록 (실패 시 무한 재시도) ────────────────────────────────────
+    let reg_req = api::RegisterRequest {
         local_box,
         agent_name,
         os_type,
@@ -155,8 +157,18 @@ async fn main() -> Result<()> {
         ram: sys_info.ram,
         gpu,
         disk: sys_info.disk,
-    })
-    .await?;
+    };
+
+    let reg_data = loop {
+        log::info!("백엔드 등록 시도: {}/api/agent/register", api::base_url());
+        match api::register(&reg_req).await {
+            Ok(data) => break data,
+            Err(e) => {
+                log::error!("등록 실패: {} — 30초 후 재시도", e);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    };
     let device_key = reg_data.device_key.clone();
     log::info!("등록 완료 — deviceKey: {} agentId: {}", device_key, reg_data.agent_id);
 
@@ -345,6 +357,29 @@ async fn main() -> Result<()> {
         }
 
         tokio::time::sleep(poll_idle).await;
+    }
+}
+
+/// exe 옆 config.json → env var 주입 (env var 이미 있으면 덮지 않음)
+/// 우선순위: 런타임 env var > config.json > 컴파일 고정값 (build.rs VDESK_API_URL)
+fn load_config_to_env() {
+    let config_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("config.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("C:\\VDesk\\config.json"));
+
+    let Ok(raw) = std::fs::read_to_string(&config_path) else { return };
+    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
+
+    if std::env::var("VDESK_API_URL").is_err() {
+        if let Some(url) = cfg["api_url"].as_str() {
+            std::env::set_var("VDESK_API_URL", url);
+        }
+    }
+    if std::env::var("AGENT_RELAY_IP").is_err() {
+        if let Some(ip) = cfg["relay_ip"].as_str() {
+            std::env::set_var("AGENT_RELAY_IP", ip);
+        }
     }
 }
 
