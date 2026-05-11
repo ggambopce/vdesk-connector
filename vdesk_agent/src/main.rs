@@ -14,6 +14,7 @@
 //!   RUST_LOG        — 로그 레벨 (기본: info)
 
 mod api;
+mod control_ws;
 mod server;
 mod state;
 
@@ -149,6 +150,7 @@ async fn main() -> Result<()> {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         relay_ip: local_ip.clone(),
         relay_port,
+        product_code: std::env::var("AGENT_PRODUCT_CODE").ok(),
         public_ip,
         internal_ip,
         os: sys_info.os,
@@ -182,6 +184,9 @@ async fn main() -> Result<()> {
             log::error!("[server] 리스너 오류: {:?}", e);
         }
     });
+
+    // ── 제어 채널: WebSocket 상시 연결 태스크 (클립보드/파일 push 수신) ─────────
+    tokio::spawn(control_ws::run(device_key.clone()));
 
     // ── 백엔드 폴링 담당: heartbeat + poll 루프 ───────────────────────────────
     let hb_interval       = Duration::from_secs(10); // 비정상 종료 감지: 10s
@@ -369,7 +374,9 @@ fn load_config_to_env() {
         .unwrap_or_else(|| std::path::PathBuf::from("C:\\VDesk\\config.json"));
 
     let Ok(raw) = std::fs::read_to_string(&config_path) else { return };
-    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
+    // Windows PowerShell Set-Content -Encoding UTF8 은 BOM(U+FEFF)을 추가함 → 제거
+    let raw = raw.trim_start_matches('\u{FEFF}');
+    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(raw) else { return };
 
     if std::env::var("VDESK_API_URL").is_err() {
         if let Some(url) = cfg["api_url"].as_str() {
@@ -379,6 +386,11 @@ fn load_config_to_env() {
     if std::env::var("AGENT_RELAY_IP").is_err() {
         if let Some(ip) = cfg["relay_ip"].as_str() {
             std::env::set_var("AGENT_RELAY_IP", ip);
+        }
+    }
+    if std::env::var("AGENT_PRODUCT_CODE").is_err() {
+        if let Some(code) = cfg["product_code"].as_str() {
+            std::env::set_var("AGENT_PRODUCT_CODE", code);
         }
     }
 }
@@ -395,15 +407,27 @@ fn get_local_ip() -> String {
 }
 
 fn load_or_create_local_box() -> String {
-    let path = std::env::temp_dir().join("vdesk_agent_id");
-    if let Ok(id) = std::fs::read_to_string(&path) {
+    // 고정 경로 사용 — %TEMP%는 실행 계정(user vs SYSTEM)에 따라 달라져 중복 등록 발생
+    let fixed = std::path::Path::new("C:\\VDesk\\agent_id");
+    // 레거시: 기존 %TEMP% 파일이 있으면 고정 경로로 마이그레이션
+    let legacy = std::env::temp_dir().join("vdesk_agent_id");
+    if !fixed.exists() {
+        if let Ok(id) = std::fs::read_to_string(&legacy) {
+            let id = id.trim().to_string();
+            if !id.is_empty() {
+                let _ = std::fs::write(fixed, &id);
+                return id;
+            }
+        }
+    }
+    if let Ok(id) = std::fs::read_to_string(fixed) {
         let id = id.trim().to_string();
         if !id.is_empty() {
             return id;
         }
     }
     let id = format!("box{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
-    let _ = std::fs::write(&path, &id);
+    let _ = std::fs::write(fixed, &id);
     id
 }
 

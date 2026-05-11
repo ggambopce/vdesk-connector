@@ -27,6 +27,10 @@ pub struct RegisterRequest {
     #[serde(rename = "relayPort")]
     pub relay_port: u16,
 
+    // 플랜 코드 (config.json product_code 또는 AGENT_PRODUCT_CODE 환경변수)
+    #[serde(rename = "productCode", skip_serializing_if = "Option::is_none")]
+    pub product_code: Option<String>,
+
     // 시스템 사양 (수집 실패 시 null 전송)
     #[serde(rename = "publicIp", skip_serializing_if = "Option::is_none")]
     pub public_ip: Option<String>,

@@ -59,7 +59,7 @@ $env:VDESK_API_URL  = "http://localhost:8080"
 # → TightVNC 2.8.85 MSI 자동 설치 (port 5900, auth off)
 # → C:\VDesk\vdesk_agent.exe 복사
 # → 방화벽: TCP 20020 허용, TCP 5900 차단 (내부 전용)
-# → 작업 스케줄러: AtLogOn + Highest privileges
+# → 작업 스케줄러: AtStartup + SYSTEM 계정 (로그인 없이 부팅 시 자동 실행, 콘솔 창 없음)
 
 .\uninstall_agent.ps1   # 스케줄러 해제, 방화벽 제거, 프로세스 종료, C:\VDesk\ 삭제
 ```
@@ -182,7 +182,8 @@ All fields wrapped in `Option<>` — collection failure → `None` → field omi
 ## Key Conventions
 
 - 소스 주석과 식별자 일부는 한국어 (의도된 것).
-- `localBox` UUID는 `%TEMP%\vdesk_agent_id`에 저장 — 재시작해도 동일 deviceKey 유지. 삭제 시 새 등록.
-- **DualLogger**: stderr + `<exe_dir>/logs/vdesk_agent.log` 동시 출력. 파일은 append, 로테이션 없음.
+- `localBox` UUID는 **`C:\VDesk\agent_id`** (고정 경로)에 저장 — 재시작해도 동일 deviceKey 유지. `%TEMP%\vdesk_agent_id` 레거시 경로에서 자동 마이그레이션됨. **중요**: Task Scheduler에서 SYSTEM 계정으로 실행 시 `%TEMP%`가 사용자 계정과 다른 경로를 가리켜 서로 다른 deviceKey가 발급되는 문제 방지 — 항상 고정 경로 사용.
+- **config.json BOM**: PowerShell `Set-Content -Encoding UTF8`은 UTF-8 BOM(`﻿`)을 추가함. `serde_json::from_str`은 BOM을 처리 못함. `load_config_to_env()`에서 `raw.trim_start_matches('\u{FEFF}')` 로 BOM 제거 후 파싱.
+- **DualLogger**: stderr + `C:\VDesk\logs\vdesk_agent.log` 동시 출력. 파일은 append, 로테이션 없음.
 - heartbeat 10초, 백엔드 타임아웃 15초 — heartbeat 주기 변경 시 `SessionTimeoutScheduler` 연동 확인.
 - 테스트 없음 — 테스트 코드는 삭제됨. 변경 검증은 직접 실행으로 수행.

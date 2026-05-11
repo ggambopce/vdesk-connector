@@ -14,6 +14,7 @@
     -ApiUrl      — VDesk 서버 URL (기본: "https://vdesk.co.kr")
     -Port        — 에이전트 리스닝 포트 (기본: "20020")
     -VncPassword — TightVNC 비밀번호 (기본: "1234")
+    -ProductCode — VM 플랜 코드 (기본: "BASIC_PLAN"; 예: "STANDARD_PLAN", "BUSINESS_PLAN")
 
 환경변수 override:
     VNC_PASSWORD  — TightVNC 비밀번호 (-VncPassword 파라미터보다 우선)
@@ -21,7 +22,8 @@
 param(
     [string]$ApiUrl      = "https://vdesk.co.kr",
     [string]$Port        = "20020",
-    [string]$VncPassword = "1234"
+    [string]$VncPassword = "1234",
+    [string]$ProductCode = "BASIC_PLAN"
 )
 
 Set-StrictMode -Version Latest
@@ -61,10 +63,10 @@ Write-Host "[1/6] 설치 디렉터리 생성: $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path "$InstallDir\logs" | Out-Null
 
-# config.json 생성 (에이전트가 API URL 읽기용)
-$config = [ordered]@{ api_url = $ApiUrl; port = [int]$Port } | ConvertTo-Json
+# config.json 생성 (에이전트가 API URL, 플랜 코드 읽기용)
+$config = [ordered]@{ api_url = $ApiUrl; port = [int]$Port; product_code = $ProductCode } | ConvertTo-Json
 Set-Content -Path "$InstallDir\config.json" -Value $config -Encoding UTF8
-Write-Host "      config.json: $InstallDir\config.json (api_url=$ApiUrl)"
+Write-Host "      config.json: $InstallDir\config.json (api_url=$ApiUrl, product_code=$ProductCode)"
 
 # ── exe 복사 ──────────────────────────────────────────────────────────────────
 $DstExe = "$InstallDir\$ExeName"
@@ -147,6 +149,29 @@ if ($svc) {
 } else {
     Write-Warning "TightVNC 서비스($TvncService)를 찾을 수 없습니다. 수동 설치 필요"
 }
+
+# TightVNC 레지스트리 설정 — 에이전트 연결 필수 설정
+# AllowLoopback=1 : 에이전트가 127.0.0.1:5900으로 연결하므로 반드시 활성화 (기본값 0 = 차단)
+# UseVncAuthentication=0 : noVNC는 투명 프록시 경유 — 비밀번호 프롬프트 없이 자동 연결
+#   보안은 Spring sessionKey + 포트 5900 외부 방화벽 차단으로 확보
+$tvncReg = "HKLM:\SOFTWARE\TightVNC\Server"
+if (Test-Path $tvncReg) {
+    Set-ItemProperty -Path $tvncReg -Name "AllowLoopback"             -Value 1 -Type DWord
+    Set-ItemProperty -Path $tvncReg -Name "UseVncAuthentication"      -Value 0 -Type DWord
+    Set-ItemProperty -Path $tvncReg -Name "UseControlAuthentication"  -Value 0 -Type DWord
+    Write-Host "      TightVNC 레지스트리: AllowLoopback=1, VncAuth=0 설정 완료"
+    Restart-Service -Name $TvncService -Force -ErrorAction SilentlyContinue
+    Write-Host "      TightVNC 서비스 재시작 완료 (설정 반영)"
+} else {
+    Write-Warning "TightVNC 레지스트리 경로를 찾을 수 없습니다 — AllowLoopback 수동 설정 필요"
+}
+
+# TightVNC 트레이 앱 자동시작 제거 (서비스만 사용, VM 사용자에게 아이콘 미노출)
+Remove-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" `
+    -Name "TightVNC" -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" `
+    -Name "TightVNC" -ErrorAction SilentlyContinue
+Write-Host "      TightVNC 트레이 앱 자동시작 제거 완료"
 
 # 포트 5900은 외부에서 직접 접근 불가 — 방화벽 차단 (에이전트 중계로만 접근)
 $vnc5900Rule = Get-NetFirewallRule -DisplayName "VDesk VNC 5900 Block" -ErrorAction SilentlyContinue
